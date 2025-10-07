@@ -6,4 +6,4 @@ Python module for Hamilton VENUS method
 
 Python Code to Control Hardware
 
-- Teleshake(./Teleshake/Teleshake.md)
+- [Teleshake](./Teleshake/Teleshake.md)

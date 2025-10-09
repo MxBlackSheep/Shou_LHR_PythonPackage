@@ -1,8 +1,56 @@
-import serial
-import time
+import builtins
+import logging
+import os
 import sys
-from typing import List, Tuple, Optional
+import time
 from enum import IntEnum
+from typing import List, Tuple, Optional
+
+import serial
+
+LOG_DIRECTORY = r"C:\Python Log"
+_LOGGER_INITIALIZED = False
+_LOG_FILE_PATH: Optional[str] = None
+_ORIGINAL_PRINT = builtins.print
+
+
+def setup_logging() -> str:
+    """Configure logging to file and mirror standard output."""
+    global _LOGGER_INITIALIZED, _LOG_FILE_PATH
+
+    if _LOGGER_INITIALIZED and _LOG_FILE_PATH:
+        return _LOG_FILE_PATH
+
+    os.makedirs(LOG_DIRECTORY, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(LOG_DIRECTORY, f"Teleshake_{timestamp}.log")
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+
+    def print_and_log(*args, **kwargs):
+        sep = kwargs.get("sep", " ")
+        message = sep.join(str(arg) for arg in args)
+        target = kwargs.get("file", sys.stdout)
+
+        if target is sys.stderr:
+            logging.error(message)
+        else:
+            logging.info(message)
+
+        _ORIGINAL_PRINT(*args, **kwargs)
+
+    builtins.print = print_and_log
+
+    _LOGGER_INITIALIZED = True
+    _LOG_FILE_PATH = log_path
+    logging.info("Logging initialized.")
+    return log_path
 
 
 class TeleshakeCommand(IntEnum):
@@ -97,11 +145,16 @@ class TeleshakeController:
         """
         # Convert speed to cycle time in microseconds
         # Assuming speed is in shakes/minute or RPM
-        if speed > 0:
-            # 60,000,000 microseconds per minute / speed = cycle time
-            cycle_time_us = int(60_000_000 / speed)
-        else:
-            cycle_time_us = 0
+        if speed < 1000:
+            raise ValueError("Speed must be at least 1000 shakes per minute.")
+
+        # 60,000,000 microseconds per minute / speed = cycle time
+        cycle_time_us = int(60_000_000 / speed)
+
+        if cycle_time_us > 0xFFFFFF:
+            raise ValueError(
+                f"Speed {speed} results in a cycle time exceeding the 24-bit limit."
+            )
 
         # Split into 3 bytes (24-bit value)
         high_byte = (cycle_time_us >> 16) & 0xFF
@@ -154,7 +207,7 @@ class TeleshakeController:
             if self.serial_port.in_waiting > 0:
                 byte_data = self.serial_port.read(1)
                 if byte_data:
-                    response.append(ord(byte_data))
+                    response.append(byte_data[0])
 
         if len(response) == 6:
             print(f"Received: {' '.join(f'{b:03d}' for b in response)}")
@@ -193,7 +246,9 @@ class TeleshakeController:
         # Read response
         response = []
         while self.serial_port.in_waiting > 0:
-            response.append(ord(self.serial_port.read(1)))
+            byte_data = self.serial_port.read(1)
+            if byte_data:
+                response.append(byte_data[0])
 
         if response:
             print(f"Initialization response: {' '.join(f'{b:03d}' for b in response)}")
@@ -211,7 +266,11 @@ class TeleshakeController:
             True if successful
         """
         print(f"\n--- Setting Speed to {speed} ---")
-        high, mid, low = self.speed_to_cycle_time(speed)
+        try:
+            high, mid, low = self.speed_to_cycle_time(speed)
+        except ValueError as exc:
+            print(f"Invalid speed: {exc}")
+            return False
         print(f"Cycle time bytes: high={high}, mid={mid}, low={low}")
 
         response = self.send_command(TeleshakeCommand.SET_CYCLE_TIME, [high, mid, low])
@@ -264,11 +323,16 @@ class TeleshakeController:
 def main():
     """Execute the specified shaking sequence"""
 
+    log_path = setup_logging()
+    print(f"Log file: {log_path}")
+
     # Configuration
     if len(sys.argv) > 1:
         com_port = sys.argv[1]
     else:
         com_port = 'COM6'  # Default from your logs
+
+    print(f"Using COM port: {com_port}")
 
     # Create controller
     controller = TeleshakeController(com_port, device_address=1)
@@ -291,7 +355,9 @@ def main():
         print("\n### PHASE 1: Speed 1200, 5 seconds x 10 repetitions ###")
         for i in range(10):
             print(f"\n--- Repetition {i + 1}/10 ---")
-            controller.shake_for_duration(speed=1200, duration=5)
+            if not controller.shake_for_duration(speed=1200, duration=5):
+                print("Aborting sequence: failed to complete repetition.")
+                return
 
             if i < 9:  # Don't wait after last repetition
                 print("Waiting 2 seconds before next repetition...")
@@ -303,7 +369,9 @@ def main():
 
         # Sequence 2: Speed 1300 for 30 seconds
         print("\n### PHASE 2: Speed 1300, 30 seconds ###")
-        controller.shake_for_duration(speed=1300, duration=30)
+        if not controller.shake_for_duration(speed=1300, duration=30):
+            print("Aborting sequence: failed to complete Phase 2.")
+            return
 
         print("\n" + "=" * 60)
         print("SHAKE SEQUENCE COMPLETE")

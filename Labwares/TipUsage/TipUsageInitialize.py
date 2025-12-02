@@ -127,17 +127,19 @@ def fetch_clean(cursor, tables_in_order):
     tables_in_order: e.g. ['ColB','ColA'] meaning query TipUsage_ColB first, then _ColA.
     Returns list of (Labware, Position).
     """
+    exclude = ("VER_HT_0009", "VER_HT_0010")
     results = []
     for bucket in tables_in_order:
         sql = f"""
             SELECT TU.labware_id AS Labware, TU.position_id AS Position
             FROM Labwares.dbo.TipUsage_{bucket} AS TU
             WHERE TU.status = N'clean'
+                AND TU.labware_id NOT IN (?, ?)
             ORDER BY TU.order_id;
         """
-        cursor.execute(sql)
+        cursor.execute(sql, exclude)
         rows = cursor.fetchall()
-        log(f"Fetched CLEAN from TipUsage_{bucket}: {len(rows)} rows")
+        log(f"Fetched CLEAN (excluded 0009/0010) from TipUsage_{bucket}: {len(rows)} rows")
         results.extend(rows)
     return results
 

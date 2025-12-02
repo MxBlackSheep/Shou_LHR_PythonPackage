@@ -53,26 +53,31 @@ def fq_tip_table(bucket: str) -> str:
     return f"[Labwares].[dbo].[TipUsage_{bucket}]"
 
 
+def build_exclusion_for_status(from_status: str):
+    """
+    Return labware_ids to exclude, using the same rules as the selection code.
+      - From CLEAN tips - Dirty Tips: skip VER_HT_0009 and VER_HT_0010
+      - From Empty position - Dirty Tips: skip VER_HT_0005 and VER_HT_0003
+    """
+    if from_status == "clean":
+        return ("VER_HT_0009", "VER_HT_0010")
+    if from_status == "empty":
+        return ("VER_HT_0005", "VER_HT_0003")
+    return None
+
+
 def determine_bucket_order(cursor, log, left="ColA", right="ColB", threshold=384):
     """
     Determine which column (bucket) to treat as 'preferred' based on the number
     of CLEAN tips in each TipUsage table.
-
-    Logic:
-    - Count rows WHERE status = 'clean' in TipUsage_left and TipUsage_right.
-    - Prefer the table where clean_count < threshold (96 * 4) as an indicator
-      that this column is currently being used.
-    - If both have clean_count < threshold, prefer the hard-coded 'left' column.
-    - If both have clean_count >= threshold, default to the hard-coded 'left'
-      column but log that we’re above threshold in both.
-
-    Returns:
-        (preferred_bucket, other_bucket)
-        e.g. ('ColA', 'ColB') or ('ColB', 'ColA')
     """
     def count_clean(bucket: str) -> int:
         tbl = fq_tip_table(bucket)
-        cursor.execute(f"SELECT COUNT(*) FROM {tbl} WHERE status = ?", ("clean",))
+        sql = (
+            f"SELECT COUNT(*) FROM {tbl} "
+            f"WHERE status = N'clean' AND labware_id NOT IN (?, ?)"
+        )
+        cursor.execute(sql, ("VER_HT_0009", "VER_HT_0010"))
         row = cursor.fetchone()
         return int(row[0]) if row and row[0] is not None else 0
 
@@ -81,7 +86,8 @@ def determine_bucket_order(cursor, log, left="ColA", right="ColB", threshold=384
         right_clean = count_clean(right)
 
         log(
-            f"CLEAN counts -> {left}: {left_clean}, {right}: {right_clean}, "
+            f"CLEAN counts (excluding VER_HT_0009/0010) -> "
+            f"{left}: {left_clean}, {right}: {right_clean}, "
             f"threshold={threshold}"
         )
 
@@ -119,27 +125,52 @@ def determine_bucket_order(cursor, log, left="ColA", right="ColB", threshold=384
         return left, right
 
 
-def count_available(cursor, bucket, from_status):
+def count_available(cursor, bucket, from_status, exclude_labwares=None):
+    """
+    Count how many tips in a bucket are in from_status, optionally skipping
+    specific labware_ids (e.g. VER_HT_0009/00010 for clean).
+    """
     tbl = fq_tip_table(bucket)
-    cursor.execute(f"SELECT COUNT(*) FROM {tbl} WHERE status = ?", (from_status,))
+    params = [from_status]
+    extra_where = ""
+    if exclude_labwares:
+        placeholders = ",".join("?" * len(exclude_labwares))
+        extra_where = f" AND labware_id NOT IN ({placeholders})"
+        params.extend(exclude_labwares)
+
+    sql = f"SELECT COUNT(*) FROM {tbl} WHERE status = ?{extra_where}"
+    cursor.execute(sql, params)
     row = cursor.fetchone()
     return int(row[0]) if row and row[0] is not None else 0
 
 
-def update_top_n(cursor, bucket, from_status, to_status, take_n):
+def update_top_n(cursor, bucket, from_status, to_status, take_n, exclude_labwares=None):
+    """
+    Update the top-N tips (by order_id) from from_status -> to_status,
+    optionally skipping specific labwares.
+    """
     if take_n <= 0:
         return 0
     tbl = fq_tip_table(bucket)
+
+    params = [from_status]
+    extra_where = ""
+    if exclude_labwares:
+        placeholders = ",".join("?" * len(exclude_labwares))
+        extra_where = f" AND labware_id NOT IN ({placeholders})"
+        params.extend(exclude_labwares)
+
     sql = f"""
         WITH nextN AS (
             SELECT TOP ({take_n}) *
             FROM {tbl}
-            WHERE status = ?
+            WHERE status = ?{extra_where}
             ORDER BY order_id
         )
         UPDATE nextN SET status = ?;
     """
-    cursor.execute(sql, (from_status, to_status))
+    params.append(to_status)
+    cursor.execute(sql, params)
     # rowcount can be -1 depending on driver; if so, assume take_n
     return cursor.rowcount if cursor.rowcount not in (-1, None) else take_n
 
@@ -187,27 +218,40 @@ def main():
         conn = establish_connection()
         cur = conn.cursor()
 
-        # Use CLEAN-count–based priority logic to decide which column to update first
-        preferred, other = determine_bucket_order(cur, log, left="ColA", right="ColB", threshold=384)
+        # Decide labware exclusion based on from_status
+        exclude_labwares = build_exclusion_for_status(from_status)
+        if exclude_labwares:
+            log(f"Excluding labwares {exclude_labwares} for from_status='{from_status}'")
+        else:
+            log(f"No labware exclusion for from_status='{from_status}'")
 
-        pref_avail = count_available(cur, preferred, from_status)
-        other_avail = count_available(cur, other, from_status)
+        # Use CLEAN-count–based priority logic to decide which column to update first
+        preferred, other = determine_bucket_order(
+            cur, log, left="ColA", right="ColB", threshold=384
+        )
+
+        pref_avail = count_available(cur, preferred, from_status, exclude_labwares)
+        other_avail = count_available(cur, other, from_status, exclude_labwares)
         log(
-            f"Available '{from_status}': "
+            f"Available '{from_status}' (respecting exclusions): "
             f"TipUsage_{preferred}={pref_avail}, TipUsage_{other}={other_avail}, "
             f"need={n}"
         )
 
         # Update preferred bucket first
         take_pref = min(n, pref_avail)
-        updated_pref = update_top_n(cur, preferred, from_status, to_status, take_pref)
+        updated_pref = update_top_n(
+            cur, preferred, from_status, to_status, take_pref, exclude_labwares
+        )
         remainder = n - updated_pref
 
         # Then update from the other bucket if needed
         updated_other = 0
         if remainder > 0:
             take_other = min(remainder, other_avail)
-            updated_other = update_top_n(cur, other, from_status, to_status, take_other)
+            updated_other = update_top_n(
+                cur, other, from_status, to_status, take_other, exclude_labwares
+            )
 
         total_updated = (updated_pref or 0) + (updated_other or 0)
         conn.commit()
@@ -227,7 +271,6 @@ def main():
             except Exception:
                 pass
         log(f"Fatal error: {e}")
-        print(f"ERROR: {e}")
     finally:
         try:
             if cur:

@@ -1,0 +1,25 @@
+USE EvoYeast;
+GO
+
+IF OBJECT_ID('dbo.ChampionsCulturesHistory', 'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.ChampionsCulturesHistory;
+END
+GO
+
+CREATE TABLE dbo.ChampionsCulturesHistory
+(
+    CultureID        INT       NOT NULL,
+    Iteration        INT       NOT NULL,
+    OD               FLOAT     NULL,
+    [TimeStamp]      DATETIME  NOT NULL,
+    FlEx482Em510     FLOAT     NOT NULL,
+    FlEx587Em611     FLOAT     NOT NULL,
+    OD_FlEx482Em510  FLOAT     NOT NULL,
+    OD_FlEx587Em611  FLOAT     NOT NULL
+);
+GO
+
+CREATE INDEX IX_CCH_Culture_Timestamp
+ON dbo.ChampionsCulturesHistory (CultureID, [TimeStamp] DESC);
+GO

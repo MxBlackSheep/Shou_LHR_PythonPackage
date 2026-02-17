@@ -1,6 +1,4 @@
 // {{{ 2 "SubmethodForwardDeclaration" ""
-private function exec_query( variable strQuery ) variable ;
-private function sql_initialize(  ) void ;
 function OnAbort(  ) void ;
 // }} ""
 // {{{ 5 "OnAbort" "Begin"
@@ -11,55 +9,5 @@ function OnAbort(  ) void {
 // {{{ 5 "OnAbort" "End"
 }
 // }} ""
-// {{{ 5 "sql_initialize" "Begin"
-private function sql_initialize(  ) void {
-// }} ""
-// {{ 5 "sql_initialize" "InitLocals"
-// }} ""
-// {{ 99 1 0 "d991d080_0490_485f_96756cc6c72cd475" "{B31F3543-5D80-11d4-A5EB-0050DA737D89}"
-DbQueryIndex = 0;
-// }} ""
-// {{ 100 1 0 "d5ab3870_eab9_4d00_931d700fe037fdf2" "{B31F3543-5D80-11d4-A5EB-0050DA737D89}"
-strTaskFolder = Translate("C:\\EvoTaskFiles\\");
-// }} ""
-// {{{ 101 1 0 "4beccc0d_9564_4639_8dc4210e8458efd5" "{C1F3C015-47B3-4514-9407-AC2E65043419}"
-RunID = Util::GetUniqueRunId();
-// }} ""
-// {{{ 5 "sql_initialize" "End"
-}
-// }} ""
-// {{{ 5 "exec_query" "Begin"
-private function exec_query( variable strQuery ) variable {
-// }} ""
-private variable strQueryCommand;
-// {{ 5 "exec_query" "InitLocals"
-// }} ""
-// {{{ 90 1 0 "4cdc7877_8e31_4233_af2b38b472653140" "{C1F3C015-47B3-4514-9407-AC2E65043419}"
-TrcTrace(Translate("\nBEGIN EXECUTING SQL Query"), Translate("\n"));
-// }} ""
-// {{ 91 1 0 "22bdc1b7_1e55_4181_8bc374d120e86dc6" "{B31F3544-5D80-11d4-A5EB-0050DA737D89}"
-DbQueryIndex = DbQueryIndex + 1;
-// }} ""
-// {{{ 92 1 0 "b869c031_038e_4779_a7079b726c30b4e4" "{C1F3C015-47B3-4514-9407-AC2E65043419}"
-dbResponse = StrConcat8(strTaskFolder, RunID, DbQueryIndex, Translate("_CytomatRead.txt"), Translate(""), Translate(""), Translate(""), Translate(""));
-// }} ""
-// {{{ 93 1 0 "6b3b0477_cf24_47e5_beda5459ae20e516" "{C1F3C015-47B3-4514-9407-AC2E65043419}"
-TrcTrace(Translate("Response file:  "), dbResponse);
-// }} ""
-// {{{ 94 1 0 "2a45665a_a466_4295_9772a8b2065f714b" "{C1F3C015-47B3-4514-9407-AC2E65043419}"
-strQueryCommand = StrConcat12(Translate("sqlcmd -S HAMILTON-PC\\HAMILTON -d EvoYeast -Q \"SET NOCOUNT ON; "), strQuery, Translate(""), Translate(""), Translate(""), Translate(""), Translate(""), Translate(""), Translate(""), Translate(""), Translate("\" -W -h -1 -s , -o "), dbResponse);
-// }} ""
-// {{{ 95 1 0 "55b8a71a_c5eb_465a_8e4bde1c1237619b" "{C1F3C015-47B3-4514-9407-AC2E65043419}"
-Util::SyncShell(strQueryCommand, 1, 1);
-// }} ""
-// {{{ 96 1 0 "aa2fcbcd_e047_459b_9de68f207ff77259" "{C1F3C015-47B3-4514-9407-AC2E65043419}"
-TrcTrace(Translate("END_ShoulabFunctions->ExecQuery"), Translate(""));
-// }} ""
-// {{{ 97 1 0 "7a5d088b_8b10_4583_bc76ad549793b595" "{9EC997CD-FD3B-4280-811B-49E99DCF062C}"
-return (dbResponse);
-// }} ""
-// {{{ 5 "exec_query" "End"
-}
-// }} ""
 /* {{ 2 "SubmethodInsertLine" "" */ // }} ""
-// $$author=Hamilton$$valid=0$$time=2025-10-16 11:21$$checksum=5372d4a4$$length=087$$
+// $$author=Hamilton$$valid=0$$time=2026-02-17 16:31$$checksum=75b50517$$length=087$$

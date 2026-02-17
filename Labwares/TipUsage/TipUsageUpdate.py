@@ -1,276 +1,315 @@
 import pyodbc
 import sys
 import os
+import re
 from datetime import datetime
+from collections import Counter
 
 LOG_DIR = r"C:\Python Log"
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# ---------- DB ----------
+ALLOWED_TIP_TYPES = {"300", "1000"}
+BUCKETS = ("ColA", "ColB")
+KEY_COL = "position_id"
+
+
 def establish_connection():
     return pyodbc.connect(
         "DRIVER={ODBC Driver 11 for SQL Server};"
-        "SERVER=LOCALHOST\\HAMILTON;"
+        r"SERVER=LOCALHOST\HAMILTON;"
         "DATABASE=EvoYeast;"
         "UID=Hamilton;PWD=mkdpw:V43;"
         "Trusted_Connection=no;"
         "TrustServerCertificate=yes;",
-        autocommit=False
+        autocommit=False,
     )
 
 
-def get_run_guid():
-    with establish_connection() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT TOP 1 RunGUID "
-            "FROM HamiltonVectorDB.dbo.HxRun "
-            "ORDER BY StartTime DESC"
-        )
-        row = cur.fetchone()
-        if not row:
-            raise RuntimeError("No RunGUID found in HamiltonVectorDB.dbo.HxRun.")
-        return str(row[0])
+def get_latest_run_guid():
+    try:
+        with establish_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT TOP 1 RunGUID "
+                "FROM HamiltonVectorDB.dbo.HxRun "
+                "ORDER BY StartTime DESC"
+            )
+            row = cur.fetchone()
+            return str(row[0]) if row else None
+    except Exception:
+        return None
 
 
-# ---------- Logging (created only after RunGUID is known) ----------
-def init_logger(run_id: str):
+def make_logger(run_id: str):
     script_name = os.path.splitext(os.path.basename(sys.argv[0]))[0]
     log_path = os.path.join(LOG_DIR, f"{run_id}_{script_name}.log")
 
     def log(msg: str):
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"[{now}] {msg}\n")
+        try:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{now}] {msg}\n")
+        except Exception:
+            pass
 
-    return log, log_path
+    return log
 
 
-# ---------- Helpers ----------
-def fq_tip_table(bucket: str) -> str:
-    if bucket not in ("ColA", "ColB"):
-        raise ValueError("bucket must be ColA or ColB")
+def tip_table(bucket: str, tip_type: str):
+    if bucket not in BUCKETS:
+        return None
+    if tip_type not in ALLOWED_TIP_TYPES:
+        return None
+    if tip_type == "300":
+        return f"[Labwares].[dbo].[TipUsage_300ul_{bucket}]"
     return f"[Labwares].[dbo].[TipUsage_{bucket}]"
 
 
-def build_exclusion_for_status(from_status: str):
+def parse_positions(raw: str):
     """
-    Return labware_ids to exclude, using the same rules as the selection code.
-      - From CLEAN tips - Dirty Tips: skip VER_HT_0009 and VER_HT_0010
-      - From Empty position - Dirty Tips: skip VER_HT_0005 and VER_HT_0003
+    Input example:
+      VER_HT_0001::1--VER_HT_0001::2--VER_HT_0001::3--
+
+    Returns list of (labware_id, position_id) tuples.
+    De-duplicates while preserving order.
     """
-    if from_status == "clean":
-        return ("VER_HT_0009", "VER_HT_0010")
-    if from_status == "empty":
-        return ("VER_HT_0005", "VER_HT_0003")
-    return None
+    if not raw:
+        return []
+
+    s = raw.strip()
+    if not s:
+        return []
+
+    for sep in [",", ";", "|", "\n", "\r", "\t", " "]:
+        s = s.replace(sep, "-")
+
+    parts = [p.strip() for p in re.split(r"-+", s) if p.strip()]
+
+    out = []
+    seen = set()
+    for p in parts:
+        if "::" not in p:
+            continue
+        labware_id, pos = p.split("::", 1)
+        labware_id = labware_id.strip()
+        pos = pos.strip()
+        if not labware_id or not pos:
+            continue
+        try:
+            position_id = int(pos)
+        except Exception:
+            continue
+
+        key = (labware_id, position_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+
+    return out
 
 
-def determine_bucket_order(cursor, log, left="ColA", right="ColB", threshold=384):
+def build_pos_cte(positions):
+    values_sql = ",".join(["(?, ?)"] * len(positions))
+    cte = (
+        f"WITH pos(labware_id, {KEY_COL}) AS ("
+        f" SELECT * FROM (VALUES {values_sql}) AS v(labware_id, {KEY_COL})"
+        ")"
+    )
+    params = []
+    for lw, pid in positions:
+        params.extend([lw, pid])
+    return cte, params
+
+
+def count_in_bucket(cur, table, positions):
+    if not positions:
+        return 0
+
+    cte, params = build_pos_cte(positions)
+    sql = f"""
+        {cte}
+        SELECT COUNT(*)
+        FROM {table} t
+        INNER JOIN pos p
+            ON p.labware_id = t.labware_id
+           AND p.{KEY_COL} = t.{KEY_COL};
     """
-    Determine which column (bucket) to treat as 'preferred' based on the number
-    of CLEAN tips in each TipUsage table.
-    """
-    def count_clean(bucket: str) -> int:
-        tbl = fq_tip_table(bucket)
-        sql = (
-            f"SELECT COUNT(*) FROM {tbl} "
-            f"WHERE status = N'clean' AND labware_id NOT IN (?, ?)"
-        )
-        cursor.execute(sql, ("VER_HT_0009", "VER_HT_0010"))
-        row = cursor.fetchone()
-        return int(row[0]) if row and row[0] is not None else 0
-
-    try:
-        left_clean = count_clean(left)
-        right_clean = count_clean(right)
-
-        log(
-            f"CLEAN counts (excluding VER_HT_0009/0010) -> "
-            f"{left}: {left_clean}, {right}: {right_clean}, "
-            f"threshold={threshold}"
-        )
-
-        left_in_use = left_clean < threshold
-        right_in_use = right_clean < threshold
-
-        if left_in_use and not right_in_use:
-            preferred, other = left, right
-            reason = f"{left} in-use (<{threshold}), {right} not in-use"
-        elif right_in_use and not left_in_use:
-            preferred, other = right, left
-            reason = f"{right} in-use (<{threshold}), {left} not in-use"
-        elif left_in_use and right_in_use:
-            preferred, other = left, right
-            reason = (
-                f"both in-use (<{threshold}); preferring hard-coded left ({left})"
-            )
-        else:
-            preferred, other = left, right
-            reason = (
-                f"both >= {threshold}; defaulting to hard-coded left ({left})"
-            )
-
-        log(
-            f"Determined bucket order: preferred={preferred}, other={other} "
-            f"({reason})"
-        )
-        return preferred, other
-
-    except Exception as e:
-        log(
-            f"ERROR determining bucket order: {e}. "
-            f"Defaulting to preferred={left}, other={right}"
-        )
-        return left, right
-
-
-def count_available(cursor, bucket, from_status, exclude_labwares=None):
-    """
-    Count how many tips in a bucket are in from_status, optionally skipping
-    specific labware_ids (e.g. VER_HT_0009/00010 for clean).
-    """
-    tbl = fq_tip_table(bucket)
-    params = [from_status]
-    extra_where = ""
-    if exclude_labwares:
-        placeholders = ",".join("?" * len(exclude_labwares))
-        extra_where = f" AND labware_id NOT IN ({placeholders})"
-        params.extend(exclude_labwares)
-
-    sql = f"SELECT COUNT(*) FROM {tbl} WHERE status = ?{extra_where}"
-    cursor.execute(sql, params)
-    row = cursor.fetchone()
+    cur.execute(sql, params)
+    row = cur.fetchone()
     return int(row[0]) if row and row[0] is not None else 0
 
 
-def update_top_n(cursor, bucket, from_status, to_status, take_n, exclude_labwares=None):
+def get_status_counter_in_bucket(cur, table, positions):
     """
-    Update the top-N tips (by order_id) from from_status -> to_status,
-    optionally skipping specific labwares.
+    Returns Counter of current statuses for the requested positions in this table.
+    Only counts rows that exist in this table.
     """
-    if take_n <= 0:
-        return 0
-    tbl = fq_tip_table(bucket)
+    if not positions:
+        return Counter()
 
-    params = [from_status]
-    extra_where = ""
-    if exclude_labwares:
-        placeholders = ",".join("?" * len(exclude_labwares))
-        extra_where = f" AND labware_id NOT IN ({placeholders})"
-        params.extend(exclude_labwares)
-
+    cte, params = build_pos_cte(positions)
     sql = f"""
-        WITH nextN AS (
-            SELECT TOP ({take_n}) *
-            FROM {tbl}
-            WHERE status = ?{extra_where}
-            ORDER BY order_id
-        )
-        UPDATE nextN SET status = ?;
+        {cte}
+        SELECT t.status
+        FROM {table} t
+        INNER JOIN pos p
+            ON p.labware_id = t.labware_id
+           AND p.{KEY_COL} = t.{KEY_COL};
     """
-    params.append(to_status)
-    cursor.execute(sql, params)
-    # rowcount can be -1 depending on driver; if so, assume take_n
-    return cursor.rowcount if cursor.rowcount not in (-1, None) else take_n
+    cur.execute(sql, params)
+    statuses = [str(r[0]).lower() for r in (cur.fetchall() or [])]
+    return Counter(statuses)
 
 
-# ---------- Main ----------
+def update_in_bucket(cur, table, positions, to_status):
+    """
+    Update rows in one bucket table by labware_id + position_id only.
+    Returns number of rows updated.
+    """
+    if not positions:
+        return 0
+
+    cte, params = build_pos_cte(positions)
+    sql = f"""
+        {cte}
+        UPDATE t
+        SET t.status = ?
+        FROM {table} t
+        INNER JOIN pos p
+            ON p.labware_id = t.labware_id
+           AND p.{KEY_COL} = t.{KEY_COL};
+    """
+    cur.execute(sql, params + [to_status])
+
+    if cur.rowcount not in (-1, None):
+        return int(cur.rowcount)
+
+    # Fallback: rowcount may be -1 for some drivers/settings
+    # We can re-count existence; update should not change existence, so return 0
+    # and let the strict updated_total check fail (safer).
+    return 0
+
+
+def log_status_dump(cur, tables_by_bucket, positions, log):
+    if not positions:
+        return
+
+    cte, params = build_pos_cte(positions)
+    rows = []
+
+    for bucket, table in tables_by_bucket.items():
+        sql = f"""
+            {cte}
+            SELECT t.labware_id, t.{KEY_COL}, t.status
+            FROM {table} t
+            INNER JOIN pos p
+                ON p.labware_id = t.labware_id
+               AND p.{KEY_COL} = t.{KEY_COL};
+        """
+        cur.execute(sql, params)
+        for r in cur.fetchall() or []:
+            rows.append((str(r[0]), int(r[1]), str(r[2]), bucket))
+
+    rows.sort(key=lambda x: (x[0], x[1], x[3]))
+
+    log("Status dump begin")
+    for lw, pid, st, bucket in rows:
+        log(f"Status {bucket} {lw} {pid} status={st}")
+    log("Status dump end")
+
+
+def print_usage(script):
+    print(f"Usage: {script} <Positions> <ToStatus> <TipType>")
+    print(f"Example: {script} \"VER_HT_0001::1-VER_HT_0001::2\" empty 1000")
+
+
 def main():
-    # args
     if len(sys.argv) != 4:
-        print(f"Usage: {sys.argv[0]} <TipMask> <FromStatus> <ToStatus>")
-        print(f"Example: {sys.argv[0]} 11111111 clean empty")
-        sys.exit(2)
-
-    tipmask = sys.argv[1].strip()
-    from_status = sys.argv[2].strip().lower()
-    to_status = sys.argv[3].strip().lower()
-
-    # TipMask is only used for the COUNT of '1's
-    if not all(c in "01" for c in tipmask):
-        sys.exit(2)
-    n = tipmask.count("1")
-    if n <= 0:
-        sys.exit(0)
-
-    # 1) Get RunGUID first
-    try:
-        run_id = get_run_guid()
-    except Exception as e:
-        # Cannot log yet because logger depends on RunGUID
-        print(f"ERROR getting RunGUID: {e}")
+        print_usage(sys.argv[0])
         sys.exit(1)
 
-    # 2) Initialize logger based on RunGUID
-    log, log_path = init_logger(run_id)
+    raw_positions = (sys.argv[1] or "").strip()
+    to_status = (sys.argv[2] or "").strip().lower()
+    tip_type = (sys.argv[3] or "").strip()
+
+    if tip_type not in ALLOWED_TIP_TYPES:
+        print(f"ERROR: TipType must be one of {sorted(ALLOWED_TIP_TYPES)}")
+        sys.exit(1)
+
+    positions = parse_positions(raw_positions)
+    if not positions:
+        print("ERROR: Positions string did not contain any valid labware_id::position_id entries")
+        sys.exit(1)
+
+    run_id = get_latest_run_guid()
+    if not run_id:
+        print("ERROR getting RunGUID")
+        sys.exit(1)
+
+    log = make_logger(run_id)
     log(f"RunGUID: {run_id}")
-    log(
-        f"TipMask = {tipmask} (count={n}) -> updating next {n} tips "
-        f"from '{from_status}' to '{to_status}'"
-    )
+    log(f"TipType: {tip_type}")
+    log(f"ToStatus={to_status}")
+    log(f"Positions received: {len(positions)}")
+    log(f"RawPositions={raw_positions}")
+
+    tables = {
+        "ColA": tip_table("ColA", tip_type),
+        "ColB": tip_table("ColB", tip_type),
+    }
+    if not tables["ColA"] or not tables["ColB"]:
+        log("ERROR: Could not resolve table names")
+        sys.exit(1)
 
     conn = None
     cur = None
-    exit_code = 0
 
     try:
         conn = establish_connection()
         cur = conn.cursor()
 
-        # Decide labware exclusion based on from_status
-        exclude_labwares = build_exclusion_for_status(from_status)
-        if exclude_labwares:
-            log(f"Excluding labwares {exclude_labwares} for from_status='{from_status}'")
-        else:
-            log(f"No labware exclusion for from_status='{from_status}'")
+        # 1) Strict existence check
+        exist_total = sum(count_in_bucket(cur, tables[b], positions) for b in BUCKETS)
+        log(f"Existence total={exist_total} requested={len(positions)}")
+        if exist_total != len(positions):
+            log_status_dump(cur, tables, positions, log)
+            log("ERROR: Some requested positions not found. Rolling back.")
+            conn.rollback()
+            sys.exit(1)
 
-        # Use CLEAN-count–based priority logic to decide which column to update first
-        preferred, other = determine_bucket_order(
-            cur, log, left="ColA", right="ColB", threshold=384
-        )
+        # 2) Log current statuses (no OUTPUT, compatible with triggers)
+        before_counter = Counter()
+        for b in BUCKETS:
+            before_counter.update(get_status_counter_in_bucket(cur, tables[b], positions))
+        log(f"Before-status breakdown: {dict(before_counter)}")
 
-        pref_avail = count_available(cur, preferred, from_status, exclude_labwares)
-        other_avail = count_available(cur, other, from_status, exclude_labwares)
-        log(
-            f"Available '{from_status}' (respecting exclusions): "
-            f"TipUsage_{preferred}={pref_avail}, TipUsage_{other}={other_avail}, "
-            f"need={n}"
-        )
+        # 3) Update by labware_id + position_id only
+        updated_total = sum(update_in_bucket(cur, tables[b], positions, to_status) for b in BUCKETS)
+        log(f"Updated total={updated_total} requested={len(positions)}")
 
-        # Update preferred bucket first
-        take_pref = min(n, pref_avail)
-        updated_pref = update_top_n(
-            cur, preferred, from_status, to_status, take_pref, exclude_labwares
-        )
-        remainder = n - updated_pref
+        if updated_total != len(positions):
+            log_status_dump(cur, tables, positions, log)
+            log("ERROR: Updated count mismatch. Rolling back.")
+            conn.rollback()
+            sys.exit(1)
 
-        # Then update from the other bucket if needed
-        updated_other = 0
-        if remainder > 0:
-            take_other = min(remainder, other_avail)
-            updated_other = update_top_n(
-                cur, other, from_status, to_status, take_other, exclude_labwares
-            )
-
-        total_updated = (updated_pref or 0) + (updated_other or 0)
         conn.commit()
-
-        log(
-            f"Updated {total_updated} rows from '{from_status}' to '{to_status}' "
-            f"(TipUsage_{preferred}: {updated_pref}, "
-            f"TipUsage_{other}: {updated_other}; requested {n})."
-        )
         log("Commit successful.")
+        sys.exit(0)
 
     except Exception as e:
-        exit_code = 1
-        if conn:
-            try:
+        try:
+            log(f"Fatal error: {type(e).__name__}: {e}")
+        except Exception:
+            pass
+        try:
+            if conn:
                 conn.rollback()
-            except Exception:
-                pass
-        log(f"Fatal error: {e}")
+        except Exception:
+            pass
+        sys.exit(1)
+
     finally:
         try:
             if cur:
@@ -279,7 +318,6 @@ def main():
                 conn.close()
         except Exception:
             pass
-        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

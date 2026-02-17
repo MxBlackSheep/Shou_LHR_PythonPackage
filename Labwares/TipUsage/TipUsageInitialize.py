@@ -29,7 +29,9 @@ def establish_connection():
         "DRIVER={ODBC Driver 11 for SQL Server};"
         "SERVER=LOCALHOST\\HAMILTON;"
         "DATABASE=EvoYeast;"
-        "UID=Hamilton;PWD=mkdpw:V43;Trust_Connection=no;TrustServerCertificate=yes;",
+        "UID=Hamilton;PWD=mkdpw:V43;"
+        "Trusted_Connection=no;"
+        "TrustServerCertificate=yes;",
         autocommit=True
     )
 
@@ -59,111 +61,165 @@ def get_runID():
         sys.exit(1)
 
 
-def determine_bucket_order(cursor, left="ColA", right="ColB", threshold=384):
+def table_name_1000(bucket: str) -> str:
+    if bucket not in ("ColA", "ColB"):
+        raise ValueError("bucket must be ColA or ColB")
+    return f"Labwares.dbo.TipUsage_{bucket}"
+
+
+def table_name_300(bucket: str) -> str:
+    if bucket not in ("ColA", "ColB"):
+        raise ValueError("bucket must be ColA or ColB")
+    return f"Labwares.dbo.TipUsage_300ul_{bucket}"
+
+
+def reserved_to_unclear(cursor, full_table_name: str) -> int:
     """
-    Determine which column (bucket) to treat as 'preferred' based on the number
-    of CLEAN tips in each TipUsage table.
+    Convert reserved to unclear for a given table.
+    Returns number of rows affected if available, otherwise returns 0.
+    """
+    sql = f"""
+        UPDATE {full_table_name}
+        SET status = N'unclear'
+        WHERE status = N'reserved';
+    """
+    cursor.execute(sql)
+    rc = cursor.rowcount
+    if rc is None or rc == -1:
+        rc = 0
+    log(f"Updated reserved to unclear in {full_table_name}: rowcount={rc}")
+    return rc
 
-    Logic:
-    - Count rows WHERE status = 'clean' in TipUsage_left and TipUsage_right.
-    - Prefer the table where clean_count < threshold (96 * 4) as an indicator
-      that this column is currently being used.
-    - If both have clean_count < threshold, prefer the hard-coded 'left' column.
-    - If both have clean_count >= threshold, default to the hard-coded 'left'
-      column but log that we’re above threshold in both.
 
-    Returns:
-        (preferred_bucket, other_bucket)
-        e.g. ('ColA', 'ColB') or ('ColB', 'ColA')
+def determine_bucket_order(
+    cursor,
+    table_func,
+    left="ColA",
+    right="ColB",
+    exclude_labwares=None,
+    label="",
+):
+    """
+    Corrected prioritisation logic:
+      - Count CLEAN tips per column (optionally excluding labwares that should never be used)
+      - If both columns have CLEAN tips, prioritise the one with fewer CLEAN tips
+      - If only one has CLEAN tips, prioritise that one
+      - If neither has CLEAN tips, default to left
     """
     def count_clean(bucket_name: str) -> int:
-        sql = f"""
-            SELECT COUNT(*)
-            FROM Labwares.dbo.TipUsage_{bucket_name}
-            WHERE status = N'clean';
-        """
-        cursor.execute(sql)
+        tbl = table_func(bucket_name)
+
+        if exclude_labwares:
+            placeholders = ",".join(["?"] * len(exclude_labwares))
+            sql = f"""
+                SELECT COUNT(*)
+                FROM {tbl}
+                WHERE status = N'clean'
+                  AND labware_id NOT IN ({placeholders});
+            """
+            cursor.execute(sql, exclude_labwares)
+        else:
+            sql = f"SELECT COUNT(*) FROM {tbl} WHERE status = N'clean';"
+            cursor.execute(sql)
+
         row = cursor.fetchone()
         return int(row[0]) if row and row[0] is not None else 0
 
-    try:
-        left_clean = count_clean(left)
-        right_clean = count_clean(right)
+    left_clean = count_clean(left)
+    right_clean = count_clean(right)
 
-        log(f"CLEAN counts -> {left}: {left_clean}, {right}: {right_clean}, "
-            f"threshold={threshold}")
+    log(f"{label} CLEAN counts -> {left}: {left_clean}, {right}: {right_clean}, exclude={exclude_labwares}")
 
-        left_in_use = left_clean < threshold
-        right_in_use = right_clean < threshold
-
-        if left_in_use and not right_in_use:
+    if left_clean > 0 and right_clean > 0:
+        if left_clean < right_clean:
             preferred, other = left, right
-            reason = f"{left} in-use (<{threshold}), {right} not in-use"
-        elif right_in_use and not left_in_use:
+            reason = f"both have clean tips; fewer clean in {left}"
+        elif right_clean < left_clean:
             preferred, other = right, left
-            reason = f"{right} in-use (<{threshold}), {left} not in-use"
-        elif left_in_use and right_in_use:
-            # Both "in use" – prefer the hard-coded left
-            preferred, other = left, right
-            reason = (f"both in-use (<{threshold}); preferring hard-coded left ({left})")
+            reason = f"both have clean tips; fewer clean in {right}"
         else:
-            # Both >= threshold – no obvious 'current' column; default to left
             preferred, other = left, right
-            reason = (f"both >= {threshold}; defaulting to hard-coded left ({left})")
+            reason = f"both have equal clean tips; defaulting to {left}"
+    elif left_clean > 0:
+        preferred, other = left, right
+        reason = f"only {left} has clean tips"
+    elif right_clean > 0:
+        preferred, other = right, left
+        reason = f"only {right} has clean tips"
+    else:
+        preferred, other = left, right
+        reason = f"no clean tips in either; defaulting to {left}"
 
-        log(f"Determined bucket order: preferred={preferred}, other={other} "
-            f"({reason})")
-        return preferred, other
-
-    except Exception as e:
-        # If anything goes wrong, fall back to left as preferred
-        log(f"ERROR determining bucket order: {e}. "
-            f"Defaulting to preferred={left}, other={right}")
-        return left, right
+    log(f"{label} Determined bucket order: preferred={preferred}, other={other} ({reason})")
+    return preferred, other
 
 
-def fetch_clean(cursor, tables_in_order):
+def fetch_clean(cursor, tables_in_order, table_func, exclude_labwares=None, label=""):
     """
-    tables_in_order: e.g. ['ColB','ColA'] meaning query TipUsage_ColB first, then _ColA.
-    Returns list of (Labware, Position).
+    Fetch (Labware, Position) rows where status is clean, ordered by order_id.
+    exclude_labwares can be a tuple like ("VER_HT_0009", "VER_HT_0010") or None.
     """
-    exclude = ("VER_HT_0009", "VER_HT_0010")
     results = []
     for bucket in tables_in_order:
-        sql = f"""
-            SELECT TU.labware_id AS Labware, TU.position_id AS Position
-            FROM Labwares.dbo.TipUsage_{bucket} AS TU
-            WHERE TU.status = N'clean'
-                AND TU.labware_id NOT IN (?, ?)
-            ORDER BY TU.order_id;
-        """
-        cursor.execute(sql, exclude)
+        tbl = table_func(bucket)
+
+        if exclude_labwares:
+            placeholders = ",".join(["?"] * len(exclude_labwares))
+            sql = f"""
+                SELECT TU.labware_id AS Labware, TU.position_id AS Position
+                FROM {tbl} AS TU
+                WHERE TU.status = N'clean'
+                  AND TU.labware_id NOT IN ({placeholders})
+                ORDER BY TU.order_id;
+            """
+            cursor.execute(sql, exclude_labwares)
+        else:
+            sql = f"""
+                SELECT TU.labware_id AS Labware, TU.position_id AS Position
+                FROM {tbl} AS TU
+                WHERE TU.status = N'clean'
+                ORDER BY TU.order_id;
+            """
+            cursor.execute(sql)
+
         rows = cursor.fetchall()
-        log(f"Fetched CLEAN (excluded 0009/0010) from TipUsage_{bucket}: {len(rows)} rows")
+        log(f"{label} Fetched CLEAN from {tbl}: {len(rows)} rows")
         results.extend(rows)
+
     return results
 
 
-def fetch_available_non_dirty(cursor, tables_in_order):
+def fetch_available_non_dirty(cursor, tables_in_order, table_func, exclude_labwares=None, label=""):
     """
-    'Dirty file' logic: choose tips that are NOT dirty/rinsed/washed
-    and exclude labwares VER_HT_0005 and VER_HT_0003.
-    Returns list of (Labware, Position).
+    "Dirty file" logic: choose tips that are NOT dirty, rinsed, washed.
     """
-    exclude = ("VER_HT_0005", "VER_HT_0003")
     results = []
     for bucket in tables_in_order:
-        sql = f"""
-            SELECT TU.labware_id AS Labware, TU.position_id AS Position
-            FROM Labwares.dbo.TipUsage_{bucket} AS TU
-            WHERE TU.status NOT IN (N'dirty', N'rinsed', N'washed')
-              AND TU.labware_id NOT IN (?, ?)
-            ORDER BY TU.order_id;
-        """
-        cursor.execute(sql, exclude)
+        tbl = table_func(bucket)
+
+        if exclude_labwares:
+            placeholders = ",".join(["?"] * len(exclude_labwares))
+            sql = f"""
+                SELECT TU.labware_id AS Labware, TU.position_id AS Position
+                FROM {tbl} AS TU
+                WHERE TU.status NOT IN (N'dirty', N'rinsed', N'washed')
+                  AND TU.labware_id NOT IN ({placeholders})
+                ORDER BY TU.order_id;
+            """
+            cursor.execute(sql, exclude_labwares)
+        else:
+            sql = f"""
+                SELECT TU.labware_id AS Labware, TU.position_id AS Position
+                FROM {tbl} AS TU
+                WHERE TU.status NOT IN (N'dirty', N'rinsed', N'washed')
+                ORDER BY TU.order_id;
+            """
+            cursor.execute(sql)
+
         rows = cursor.fetchall()
-        log(f"Fetched NON-DIRTY (excluded 0005/0003) from TipUsage_{bucket}: {len(rows)} rows")
+        log(f"{label} Fetched NON-DIRTY from {tbl}: {len(rows)} rows")
         results.extend(rows)
+
     return results
 
 
@@ -172,7 +228,6 @@ def write_sequence(path, rows, sequence_name, layout_path):
         w = csv.writer(f)
         w.writerow(["Id", "Layout", "Sequence", "Labware", "Position"])
         for idx, r in enumerate(rows, start=1):
-            # r can be pyodbc.Row or tuple
             lab = r[0]
             pos = int(r[1])
             w.writerow([idx, layout_path, sequence_name, lab, pos])
@@ -187,26 +242,87 @@ def main():
     exit_code = 0
 
     try:
-        # Determine priority order between columns based on CLEAN counts
-        pref, other = determine_bucket_order(cursor, left="ColA", right="ColB", threshold=384)
-        tables_in_order = [pref, other]  # e.g., ['ColA', 'ColB']
+        # Step 1: Safety recovery
+        for tbl in (table_name_1000("ColA"), table_name_1000("ColB"), table_name_300("ColA"), table_name_300("ColB")):
+            reserved_to_unclear(cursor, tbl)
 
-        # Fetch two sets
-        clean_rows = fetch_clean(cursor, tables_in_order)
-        avail_rows = fetch_available_non_dirty(cursor, tables_in_order)
+        # Correct exclusions for CLEAN sequence construction
+        # 1000ul excludes empty racks 0009 and 0010
+        exclude_clean_1000 = ("VER_HT_0009", "VER_HT_0010")
+        # 300ul excludes empty racks 0001 and 0004
+        exclude_clean_300 = ("VER_ST_0009", "VER_ST_0010")
 
-        # Paths / names
+        # Step 2: Determine priority order for 1000ul tips using corrected rule
+        pref_1000, other_1000 = determine_bucket_order(
+            cursor,
+            table_func=table_name_1000,
+            left="ColA",
+            right="ColB",
+            exclude_labwares=exclude_clean_1000,
+            label="1000ul",
+        )
+        tables_1000 = [pref_1000, other_1000]
+
+        # Step 3: Determine priority order for 300ul tips using corrected rule
+        pref_300, other_300 = determine_bucket_order(
+            cursor,
+            table_func=table_name_300,
+            left="ColA",
+            right="ColB",
+            exclude_labwares=exclude_clean_300,
+            label="300ul",
+        )
+        tables_300 = [pref_300, other_300]
+
+        # Step 4: Fetch 1000ul sets
+        clean_1000 = fetch_clean(
+            cursor,
+            tables_1000,
+            table_func=table_name_1000,
+            exclude_labwares=exclude_clean_1000,
+            label="1000ul",
+        )
+        avail_1000 = fetch_available_non_dirty(
+            cursor,
+            tables_1000,
+            table_func=table_name_1000,
+            exclude_labwares=("VER_HT_0005", "VER_HT_0003"),
+            label="1000ul",
+        )
+
+        # Step 5: Fetch 300ul sets
+        clean_300 = fetch_clean(
+            cursor,
+            tables_300,
+            table_func=table_name_300,
+            exclude_labwares=exclude_clean_300,
+            label="300ul",
+        )
+        avail_300 = fetch_available_non_dirty(
+            cursor,
+            tables_300,
+            table_func=table_name_300,
+            exclude_labwares=("VER_ST_0001", "VER_ST_0004"),
+            label="300ul",
+        )
+
+        # Step 6: Paths / names
         run_id = get_runID()
         layout_path = (
             r"C:\PROGRAM FILES\HAMILTON\METHODS\LABPROTOCOLS\EXPERIMENTS\DECKS"
             r"\SPATIALEVOLUTION3OD384WELL.LAY"
         )
-        out_clean = os.path.join(evotask_dir, f"{run_id}_Clean1000_Positions.txt")
-        out_dirty = os.path.join(evotask_dir, f"{run_id}_Dirty1000_Positions.txt")
 
-        # Write files (VENUS format)
-        write_sequence(out_clean, clean_rows, "Clean1000ulTips", layout_path)
-        write_sequence(out_dirty, avail_rows, "Dirty1000ulTips", layout_path)
+        out_clean_1000 = os.path.join(evotask_dir, f"{run_id}_Clean1000_Positions.txt")
+        out_dirty_1000 = os.path.join(evotask_dir, f"{run_id}_Dirty1000_Positions.txt")
+        out_clean_300 = os.path.join(evotask_dir, f"{run_id}_Clean300_Positions.txt")
+        out_dirty_300 = os.path.join(evotask_dir, f"{run_id}_Dirty300_Positions.txt")
+
+        # Step 7: Write files
+        write_sequence(out_clean_1000, clean_1000, "Clean1000ulTips", layout_path)
+        write_sequence(out_dirty_1000, avail_1000, "Dirty1000ulTips", layout_path)
+        write_sequence(out_clean_300, clean_300, "Clean300ulTips", layout_path)
+        write_sequence(out_dirty_300, avail_300, "Dirty300ulTips", layout_path)
 
     except Exception as e:
         log(f"Fatal error: {e}")
@@ -217,7 +333,6 @@ def main():
             log("Connection Closed")
         except Exception as e:
             log(f"ERROR closing connection: {e}")
-            # If we already had an error, keep exit_code=1; otherwise mark as error
             if exit_code == 0:
                 exit_code = 1
         sys.exit(exit_code)

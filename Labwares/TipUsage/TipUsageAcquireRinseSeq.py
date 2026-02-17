@@ -113,9 +113,9 @@ def determine_bucket_order(cursor, table_prefix, left="ColA", right="ColB", thre
         return left, right
 
 
-def fetch_wash(cursor, table_prefix, tables_in_order, label="1000ul"):
+def fetch_rinse(cursor, table_prefix, tables_in_order, label="1000ul"):
     """
-    Fetch all Positions TO BE WASHED (status = 'rinsed') from:
+    Fetch all Positions TO BE RINSED (status = 'dirty') from:
       Labwares.dbo.{table_prefix}{ColA/ColB}
 
     Returns list of (Labware, Position).
@@ -125,12 +125,12 @@ def fetch_wash(cursor, table_prefix, tables_in_order, label="1000ul"):
         sql = f"""
             SELECT TU.labware_id AS Labware, TU.position_id AS Position
             FROM Labwares.dbo.{table_prefix}{bucket} AS TU
-            WHERE TU.status = N'rinsed'
+            WHERE TU.status = N'dirty'
             ORDER BY TU.order_id;
         """
         cursor.execute(sql)
         rows = cursor.fetchall()
-        log(f"{label} Fetched Wash from {table_prefix}{bucket}: {len(rows)} rows")
+        log(f"{label} Fetched Rinse from {table_prefix}{bucket}: {len(rows)} rows")
         results.extend(rows)
     return results
 
@@ -171,10 +171,10 @@ def main():
             label="1000ul",
         )
         tables_1000 = [pref_1000, other_1000]
-        wash_1000 = fetch_wash(cursor, "TipUsage_", tables_1000, label="1000ul")
+        rinse_1000 = fetch_rinse(cursor, "TipUsage_", tables_1000, label="1000ul")
 
-        out_wash_1000 = os.path.join(evotask_dir, f"{run_id}_Wash1000_Positions.txt")
-        write_sequence(out_wash_1000, wash_1000, "Dirty1000ulTips", layout_path)
+        out_rinse_1000 = os.path.join(evotask_dir, f"{run_id}_Rinse1000_Positions.txt")
+        write_sequence(out_rinse_1000, rinse_1000, "Dirty1000ulTips", layout_path)
 
         # ---------------- 300ul (new) ----------------
         pref_300, other_300 = determine_bucket_order(
@@ -186,10 +186,10 @@ def main():
             label="300ul",
         )
         tables_300 = [pref_300, other_300]
-        wash_300 = fetch_wash(cursor, "TipUsage_300ul_", tables_300, label="300ul")
+        rinse_300 = fetch_rinse(cursor, "TipUsage_300ul_", tables_300, label="300ul")
 
-        out_wash_300 = os.path.join(evotask_dir, f"{run_id}_Wash300_Positions.txt")
-        write_sequence(out_wash_300, wash_300, "Dirty300ulTips", layout_path)
+        out_rinse_300 = os.path.join(evotask_dir, f"{run_id}_Rinse300_Positions.txt")
+        write_sequence(out_rinse_300, rinse_300, "Dirty300ulTips", layout_path)
 
     except Exception as e:
         log(f"Fatal error: {e}")

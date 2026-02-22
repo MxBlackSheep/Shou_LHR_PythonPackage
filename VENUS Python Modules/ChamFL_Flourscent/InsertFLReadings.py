@@ -4,8 +4,7 @@ import sys
 import random
 import pandas as pd
 import argparse
-import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # === Logging Setup ===
 log_dir = r"C:\Python Log"
@@ -21,13 +20,30 @@ def log(msg: str) -> None:
         f.write(f"[{now}] {msg}\n")
 
 
-# === Parse Arguments ===
-parser = argparse.ArgumentParser()
+# === Safe argparse that never writes to stderr ===
+class SafeArgumentParser(argparse.ArgumentParser):
+    def _print_message(self, message, file=None):
+        if message:
+            try:
+                log(message.strip())
+            except Exception:
+                pass
+
+    def error(self, message):
+        try:
+            log(f"ARGPARSE ERROR: {message}")
+        except Exception:
+            pass
+        raise SystemExit(2)
+
+
+# === Parse Arguments (same style as original) ===
+parser = SafeArgumentParser()
 parser.add_argument("PlateBarcode", type=str, help="Plate Barcode Identifier")
 parser.add_argument(
     "--test-mode",
     action="store_true",
-    help="If set, generate random raw files with '_test' suffix (preserving presence/absence of extension) and use them for parsing.",
+    help="If set, generate fake fluorescence that follows the iteration→OD pattern.",
 )
 args = parser.parse_args()
 PlateBarcode = args.PlateBarcode
@@ -38,25 +54,6 @@ RawDataPath_FlEx482Em510 = r"C:\Program Files\HAMILTON\Gen5Data\FlEx482Em510_dat
 RawDataPath_FlEx587Em611 = r"C:\Program Files\HAMILTON\Gen5Data\FlEx587Em611_data"
 
 
-# === Helpers ===
-def add_test_suffix_preserve_ext(path: str) -> str:
-    """
-    Add '_test' before the extension; if there is no extension, just append '_test'.
-    Examples:
-      '..._data' -> '..._data_test'
-      '..._data.txt' -> '..._data_test.txt'
-    """
-    root, ext = os.path.splitext(path)
-    return f"{root}_test{ext}"
-
-
-def wells_96():
-    rows = ["A", "B", "C", "D", "E", "F", "G", "H"]
-    cols = range(1, 13)
-    return [f"{r}{c}" for c in cols for r in rows]
-
-
-# === Database Connection ===
 def establish_connection():
     try:
         conn_str = (
@@ -73,7 +70,6 @@ def establish_connection():
         sys.exit(1)
 
 
-# === Get Latest RunID ===
 def get_runID():
     try:
         conn = establish_connection()
@@ -92,52 +88,6 @@ def get_runID():
         sys.exit(1)
 
 
-# === Random raw-file generator (for test mode) ===
-def generate_random_raw_file(raw_path: str, header_pair: str) -> str:
-    """
-    Write a random raw file in the expected Gen5-like format:
-    <header_pair>
-    Well\t<header_pair> - Mean
-    A1\t<value>
-    ...
-    """
-    try:
-        parent = os.path.dirname(raw_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-
-        ws = wells_96()
-        values = []
-        for _ in ws:
-            r = random.random()
-            if r < 0.70:
-                v = random.uniform(0, 50)
-            elif r < 0.95:
-                v = random.uniform(50, 500)
-            else:
-                v = random.uniform(500, 2200)
-
-            if random.random() < 0.4:
-                val_str = f"{int(round(v))}."
-            else:
-                val_str = str(int(round(v)))
-            values.append(val_str)
-
-        lines = [header_pair, f"Well\t{header_pair} - Mean"]
-        for well, val in zip(ws, values):
-            lines.append(f"{well}\t{val}")
-
-        with open(raw_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-
-        log(f"Generated TEST raw file with random readings: {raw_path}")
-        return raw_path
-    except Exception as e:
-        log(f"ERROR generating test raw file {raw_path}: {e}")
-        sys.exit(1)
-
-
-# === Parse Raw Data File ===
 def parse_raw_data(raw_path, plate_id, run_id):
     try:
         if not os.path.isfile(raw_path):
@@ -160,7 +110,7 @@ def parse_raw_data(raw_path, plate_id, run_id):
             if len(parts) < 2:
                 continue
             well = parts[0].strip()
-            token = parts[-1].strip().rstrip(".")  # e.g., "5." -> "5"
+            token = parts[-1].strip().rstrip(".")
             if token in ("", "-", "."):
                 token = "0"
             try:
@@ -197,41 +147,117 @@ def parse_raw_data(raw_path, plate_id, run_id):
         sys.exit(1)
 
 
+def build_test_fluorescence_dfs_from_iteration(
+    plate_id: int,
+    baseline_482: float = 10.0,
+    baseline_587: float = 10.0,
+):
+    """
+    Test mode only:
+      Iteration 1..4 => OD = 0.1, 0.2, 0.3, 0.4
+    OD is defined as OD_482 + OD_587.
+    Split: OD_482 = OD/2, OD_587 = OD/2.
+    """
+    A = 4669.1
+    D1 = 773.1
+    B = 2262.3
+    D2 = 305.0
+
+    denom = A * B + D1 * D2
+    det = A * B - D1 * D2
+    if det == 0:
+        raise RuntimeError("Inverse model determinant is 0; cannot solve for fluorescence.")
+
+    def solve_fluorescence_for_od(od_482_target: float, od_587_target: float):
+        rhs1 = denom * od_482_target
+        rhs2 = denom * od_587_target
+        fl482 = (A * rhs1 + D1 * rhs2) / det
+        fl587 = (B * rhs2 + D2 * rhs1) / det
+        return fl482, fl587
+
+    od_by_iteration = {1: 0.1, 2: 0.2, 3: 0.3, 4: 0.4}
+
+    conn = establish_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT CultureID, WellID FROM dbo.Cultures WHERE PlateID = ?", (plate_id,))
+    cultures = cur.fetchall()
+    if not cultures:
+        conn.close()
+        raise RuntimeError(f"No cultures found for PlateID={plate_id}")
+
+    cur.execute(
+        """
+        SELECT CultureID, MAX(Iteration) AS MaxIter
+        FROM dbo.ChampionsCulturesHistory
+        WHERE CultureID IN (SELECT CultureID FROM dbo.Cultures WHERE PlateID = ?)
+        GROUP BY CultureID
+        """,
+        (plate_id,),
+    )
+    latest = dict(cur.fetchall())
+    conn.close()
+
+    wells_ = []
+    fl482_vals = []
+    fl587_vals = []
+
+    for culture_id, well in cultures:
+        next_iter = (latest.get(culture_id, 0) or 0) + 1
+
+        if next_iter in od_by_iteration:
+            od_target = od_by_iteration[next_iter]
+            fl482, fl587 = solve_fluorescence_for_od(od_target / 2.0, od_target / 2.0)
+            fl482 = max(float(fl482), baseline_482)
+            fl587 = max(float(fl587), baseline_587)
+        else:
+            fl482 = random.uniform(baseline_482, baseline_482 + 2000)
+            fl587 = random.uniform(baseline_587, baseline_587 + 2000)
+
+        wells_.append(well)
+        fl482_vals.append(fl482)
+        fl587_vals.append(fl587)
+
+    df_482 = pd.DataFrame({"WellID": wells_, "Value": fl482_vals})
+    df_587 = pd.DataFrame({"WellID": wells_, "Value": fl587_vals})
+    log(f"TEST_MODE: built fake fluorescence for {len(df_482)} wells.")
+    return df_482, df_587
+
+
 def insert_champions_cultureshistory_from_raw(
     plate_id: int,
     run_id: str,
     df_482: pd.DataFrame,
     df_587: pd.DataFrame,
+    test_mode: bool,
     baseline_482: float = 10.0,
     baseline_587: float = 10.0,
 ):
-    # constants from Champions_CommencePropagationFl
     FlEx482Em510ODscale = 4669.1
     FlEx482Em510D_FlEx587Em611damp = 773.1
     FlEx587Em611ODscale = 2262.3
     FlEx587Em611D_FlEx482Em510damp = 305.0
 
+    od_by_iteration = {1: 0.1, 2: 0.2, 3: 0.3, 4: 0.4}
+
     conn = establish_connection()
     cur = conn.cursor()
 
-    # timestamp from the Run
+    # Default timestamp from the Run
     cur.execute("SELECT StartTime FROM HamiltonVectorDB.dbo.HxRun WHERE RunGUID = ?", (run_id,))
     row = cur.fetchone()
     if not row:
         conn.close()
         raise RuntimeError(f"No HxRun found for RunGUID={run_id}")
-    ts = row[0]
+    ts_default = row[0]
 
-    # Merge channels by WellID (keep only wells present in both)
     m482 = df_482[["WellID", "Value"]].rename(columns={"Value": "Fl482"})
     m587 = df_587[["WellID", "Value"]].rename(columns={"Value": "Fl587"})
     df = pd.merge(m482, m587, on="WellID", how="inner")
 
-    # Apply baselines
     df["Fl482_corr"] = df["Fl482"].clip(lower=baseline_482)
     df["Fl587_corr"] = df["Fl587"].clip(lower=baseline_587)
 
-    # Compute OD contributions exactly as in the proc
     denom = (
         FlEx482Em510ODscale * FlEx587Em611ODscale
         + FlEx482Em510D_FlEx587Em611damp * FlEx587Em611D_FlEx482Em510damp
@@ -241,14 +267,12 @@ def insert_champions_cultureshistory_from_raw(
         (FlEx587Em611ODscale * df["Fl482_corr"] - FlEx482Em510D_FlEx587Em611damp * df["Fl587_corr"])
         / denom
     )
-
     df["OD_587"] = (
         (FlEx482Em510ODscale * df["Fl587_corr"] - FlEx587Em611D_FlEx482Em510damp * df["Fl482_corr"])
         / denom
     )
 
-    # Look up CultureID for this plate/well
-    cur.execute("SELECT CultureID, WellID FROM Cultures WHERE PlateID = ?", (plate_id,))
+    cur.execute("SELECT CultureID, WellID FROM dbo.Cultures WHERE PlateID = ?", (plate_id,))
     mapping = {well: cid for (cid, well) in cur.fetchall()}
 
     df["CultureID"] = df["WellID"].map(mapping)
@@ -256,30 +280,47 @@ def insert_champions_cultureshistory_from_raw(
     if df.empty:
         conn.close()
         raise RuntimeError("No matching CultureID found for any well on this plate.")
-
     df["CultureID"] = df["CultureID"].astype(int)
 
-    # Iteration starts at 1 per CultureID in ChampionsCulturesHistory
     cur.execute(
         """
         SELECT CultureID, MAX(Iteration) AS MaxIter
         FROM dbo.ChampionsCulturesHistory
-        WHERE CultureID IN (SELECT CultureID FROM Cultures WHERE PlateID = ?)
+        WHERE CultureID IN (SELECT CultureID FROM dbo.Cultures WHERE PlateID = ?)
         GROUP BY CultureID
         """,
         (plate_id,),
     )
     latest = dict(cur.fetchall())
-
     df["Iteration"] = df["CultureID"].map(lambda cid: (latest.get(cid, 0) or 0) + 1)
 
-    # OD should be NULL for this script
+    if test_mode:
+        df["OD"] = df["Iteration"].map(lambda it: od_by_iteration.get(int(it), None))
+
+        # Per-iteration timestamp offsets (only for iter 1..4)
+        now = datetime.now()
+        offset_hours = {1: 4, 2: 3, 3: 2, 4: 1}
+
+        def ts_for_iter(it: int):
+            h = offset_hours.get(int(it))
+            if h is None:
+                return ts_default
+            return now - timedelta(hours=h)
+
+        df["TS"] = df["Iteration"].map(ts_for_iter)
+    else:
+        df["OD"] = None
+        df["TS"] = ts_default
+
+    # Make a Python list of timestamps aligned with rows
+    ts_list = df["TS"].tolist()
+
     rows = list(
         zip(
             df["CultureID"].tolist(),
             df["Iteration"].tolist(),
-            [None] * len(df),  # OD = NULL
-            [ts] * len(df),
+            df["OD"].tolist(),
+            ts_list,
             df["Fl482_corr"].tolist(),
             df["Fl587_corr"].tolist(),
             df["OD_482"].tolist(),
@@ -306,17 +347,15 @@ def insert_champions_cultureshistory_from_raw(
         conn.close()
 
 
-# === Main Workflow ===
 def main():
     try:
         run_id = get_runID()
         if TEST_MODE:
-            log("Running under test-mode")
+            log("Running under test mode")
 
-        # Retrieve PlateID by barcode
         conn = establish_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT PlateID FROM Plates WHERE BarCode = ?", (PlateBarcode,))
+        cursor.execute("SELECT PlateID FROM dbo.Plates WHERE BarCode = ?", (PlateBarcode,))
         row = cursor.fetchone()
         if not row:
             log(f"ERROR: No PlateID found for barcode {PlateBarcode}.")
@@ -326,37 +365,31 @@ def main():
         log(f"Retrieved PlateID: {plate_id}")
         conn.close()
 
-        # Select raw paths; in test-mode, generate and use *_test files
-        raw482 = RawDataPath_FlEx482Em510
-        raw587 = RawDataPath_FlEx587Em611
-
         if TEST_MODE:
-            test482 = add_test_suffix_preserve_ext(raw482)
-            test587 = add_test_suffix_preserve_ext(raw587)
-            generate_random_raw_file(test482, "482,510")
-            generate_random_raw_file(test587, "587,611")
-            raw482, raw587 = test482, test587
+            df_482, df_587 = build_test_fluorescence_dfs_from_iteration(plate_id=plate_id)
+        else:
+            df_482 = parse_raw_data(RawDataPath_FlEx482Em510, plate_id, run_id)
+            df_587 = parse_raw_data(RawDataPath_FlEx587Em611, plate_id, run_id)
 
-        # Parse raw fluorescence data
-        df_482 = parse_raw_data(raw482, plate_id, run_id)
-        df_587 = parse_raw_data(raw587, plate_id, run_id)
-
-        # Insert into ChampionsCulturesHistory
         insert_champions_cultureshistory_from_raw(
             plate_id=plate_id,
             run_id=run_id,
             df_482=df_482,
             df_587=df_587,
+            test_mode=TEST_MODE,
         )
 
-        log("=== ChampionsCulturesHistory insert completed successfully ===")
+        log("ChampionsCulturesHistory insert completed successfully")
         sys.exit(0)
 
+    except SystemExit as e:
+        if isinstance(e.code, int) and e.code != 0:
+            log(f"Exit with code {e.code}")
+        raise
     except Exception as e:
         log(f"Fatal error: {e}")
         sys.exit(1)
 
 
-# === Entry Point ===
 if __name__ == "__main__":
     main()

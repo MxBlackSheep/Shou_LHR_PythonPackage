@@ -64,6 +64,9 @@ TARGET_OD = 0.3
 PREDICT_WITHIN_HOURS = 2.0
 ROUND_MINUTES = 10
 
+# Only consider the three most recent readings per culture
+RECENT_POINTS = 3
+
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8005"
 DEFAULT_API_USERNAME = "admin"
 DEFAULT_API_PASSWORD = "ShouGroupAdmin"
@@ -382,6 +385,7 @@ def fetch_od_history_for_cultures(culture_ids: List[int]) -> List[Tuple[int, dat
     OD_sum = OD_FlEx482Em510 + OD_FlEx587Em611
 
     Uses ALL available readings for those cultures.
+    Downselection to most recent points happens in predict_time_to_target().
     """
     try:
         conn = establish_connection()
@@ -425,21 +429,26 @@ def fetch_od_history_for_cultures(culture_ids: List[int]) -> List[Tuple[int, dat
 # SELECTION + PREDICTION LOGIC (LIKELY TO CHANGE)
 # Current behavior:
 # - Fit growth per culture (ln(OD) vs time)
+# - Only use the most recent RECENT_POINTS readings per culture
 # - Predict time each culture reaches TARGET_OD
 # - Choose EARLIEST predicted time across cultures
 # -----------------------------------------
 def predict_time_to_target(
     rows: List[Tuple[int, datetime, float]],
     target_od: float,
-) -> Optional[Tuple[int, float, float, datetime, datetime]]:
+    recent_points: int = RECENT_POINTS,
+) -> Optional[Tuple[int, float, float, datetime, datetime, int]]:
     by_culture: Dict[int, List[Tuple[datetime, float]]] = {}
     for cid, ts, od in rows:
         by_culture.setdefault(cid, []).append((ts, od))
 
-    best: Optional[Tuple[int, float, float, datetime, datetime]] = None
+    best: Optional[Tuple[int, float, float, datetime, datetime, int]] = None
 
     for cid, series in by_culture.items():
         series.sort(key=lambda x: x[0])
+
+        if recent_points > 0 and len(series) > recent_points:
+            series = series[-recent_points:]
 
         if len(series) < 2:
             continue
@@ -470,7 +479,8 @@ def predict_time_to_target(
         else:
             predicted = last_time + timedelta(hours=delta_hours)
 
-        cand = (cid, float(mu), float(last_od), last_time, predicted)
+        points_used = len(series)
+        cand = (cid, float(mu), float(last_od), last_time, predicted, points_used)
         if best is None or predicted < best[4]:
             best = cand
 
@@ -505,6 +515,7 @@ def main() -> None:
         log("=== Auto-reschedule by OD prediction started ===")
         log(f"PlateBarcode={plate_barcode}")
         log(f"target_od={args.target_od} within_hours={args.within_hours} round_minutes={args.round_minutes}")
+        log(f"recent_points_per_culture={RECENT_POINTS}")
         log(f"dry_run={bool(args.dry_run)} api_base_url={args.api_base_url}")
 
         plate_id = get_plate_id_by_barcode(plate_barcode)
@@ -514,26 +525,25 @@ def main() -> None:
         log(f"Retrieved {len(culture_ids)} CultureID values for PlateID={plate_id}")
 
         rows = fetch_od_history_for_cultures(culture_ids)
-        log(f"Fetched {len(rows)} OD history rows (all available)")
+        log(f"Fetched {len(rows)} OD history rows (all available, before per-culture downselection)")
 
         if not rows:
             log("ERROR: No usable OD rows found for prediction")
             sys.exit(1)
 
-        best = predict_time_to_target(rows=rows, target_od=float(args.target_od))
+        best = predict_time_to_target(rows=rows, target_od=float(args.target_od), recent_points=RECENT_POINTS)
         if not best:
             log("ERROR: No valid growth estimates computed (check data availability and OD values)")
             sys.exit(1)
 
-        best_cid, mu, last_od, last_time, predicted_time = best
+        best_cid, mu, last_od, last_time, predicted_time, points_used = best
         od_summary = summarize_latest_od_snapshot(rows)
         predicted_rounded = ceil_dt_to_minutes(predicted_time, int(args.round_minutes))
 
-        log(f"Earliest predicted culture={best_cid} mu_per_hour={mu:.6f} last_od={last_od:.6f} last_time={last_time}")
+        log(f"Earliest predicted culture={best_cid} points_used={points_used} mu_per_hour={mu:.6f} last_od={last_od:.6f} last_time={last_time}")
         log(f"Predicted_time_raw={predicted_time.isoformat()}")
         log(f"Predicted_time_rounded={predicted_rounded.isoformat()}")
 
-        # Verification: schedule time must be in the future
         if predicted_rounded <= now:
             new_time = ceil_dt_to_minutes(now, int(args.round_minutes))
             log(f"Predicted time is not in the future, forcing start_time to {new_time.isoformat()}")
@@ -569,12 +579,6 @@ def main() -> None:
             log(f"ERROR: Failed to list schedules: {e}")
             sys.exit(1)
 
-        # -----------------------------------------
-        # SCHEDULE MATCHING POLICY (LIKELY TO CHANGE)
-        # Now requires:
-        # - experiment_name matches TARGET_SCHEDULE_NAME (case insensitive)
-        # - prerequisites contain ExperimentID (ScheduledToRun=1)
-        # -----------------------------------------
         target_schedule = None
         target_name_norm = TARGET_SCHEDULE_NAME.strip().lower()
 
@@ -623,7 +627,6 @@ def main() -> None:
 
         log(f"Schedule updated successfully schedule_id={updated.get('schedule_id')} start_time={updated.get('start_time')}")
 
-        # Send schedule-contact email only after a successful reschedule.
         try:
             updated_start_time = parse_dt(updated.get("start_time")) or predicted_rounded
             schedule_name = str(updated.get("experiment_name") or fresh.get("experiment_name") or TARGET_SCHEDULE_NAME)
@@ -642,6 +645,7 @@ def main() -> None:
                 "",
                 f"Prediction target OD: {float(args.target_od):.6f}",
                 f"Selected culture ID (earliest predicted): {best_cid}",
+                f"Points used for selected culture: {points_used}",
                 f"Estimated growth rate mu (/hr): {mu:.6f}",
                 f"Last OD used for selected culture: {last_od:.6f}",
                 f"Selected culture last timestamp: {format_dt_for_text(last_time)}",

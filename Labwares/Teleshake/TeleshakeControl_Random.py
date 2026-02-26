@@ -378,7 +378,7 @@ def main() -> int:
 
     # Ensure we always attempt to stop/disconnect on exit paths
     try:
-        # Initialize device (best-effort)
+        # Initialize device
         if not controller.initialize_device():
             log("Warning: initialization did not confirm; proceeding cautiously.")
         controller._safe_sleep(1)
@@ -387,24 +387,26 @@ def main() -> int:
         log("STARTING SHAKE SEQUENCE")
         log("=" * 60)
 
-        # Phase 1: Speed 1200 for 5 seconds, repeat 10 times
-        log("PHASE 1: Speed 1200, 5 seconds x 10 repetitions")
-        for i in range(10):
-            log(f"Repetition {i + 1}/10")
-            ok = controller.shake_for_duration(speed=1200, duration=5)
+        # Phase 1: 10 short cycles at 10 different pre-generated random speeds
+        random_speeds = [1153, 1176, 1088, 1229, 1271, 1185, 1181, 1087, 1210, 1082]
+        log(f"PHASE 1: 10 repetitions, 5 seconds each, random speeds={random_speeds}")
+
+        for i, speed in enumerate(random_speeds, start=1):
+            log(f"Repetition {i}/10 at speed={speed}")
+            ok = controller.shake_for_duration(speed=speed, duration=5)
             if not ok:
                 log("Aborting sequence: failed to complete repetition.")
                 return 1
 
-            if i < 9:
-                log("Waiting 2 seconds before next repetition...")
+            if i < 10:
+                log("Waiting 1 seconds before next repetition...")
                 controller._safe_sleep(1)
 
         log("PHASE 1 COMPLETE")
         log("Waiting 2 seconds before Phase 2...")
         controller._safe_sleep(2)
 
-        # Phase 2: Speed 1300 for 30 seconds
+        # Phase 2: Speed 1300 for 30 seconds (unchanged)
         log("PHASE 2: Speed 1300, 30 seconds")
         if not controller.shake_for_duration(speed=1300, duration=30):
             log("Aborting sequence: failed to complete Phase 2.")
@@ -417,13 +419,13 @@ def main() -> int:
         return 0
 
     except KeyboardInterrupt:
-        log("Interrupted by user - treating as failure for automation purposes.")
+        log("Interrupted by user")
         return 1
     except Exception as e:
         log_exc("Fatal error during execution", e)
         return 1
     finally:
-        # Best effort stop & disconnect (no duplicate stop spam if already disconnected)
+        # Stop & disconnect
         try:
             if controller.is_connected:
                 controller.stop_device()

@@ -396,13 +396,13 @@ def main() -> int:
                 log("Aborting sequence: failed to complete repetition.")
                 return 1
 
-            if i < 9:
-                log("Waiting 2 seconds before next repetition...")
-                controller._safe_sleep(1)
+            # if i < 9:
+                # log("Waiting 2 seconds before next repetition...")
+                # controller._safe_sleep(1)
 
         log("PHASE 1 COMPLETE")
-        log("Waiting 2 seconds before Phase 2...")
-        controller._safe_sleep(2)
+        log("Waiting 0.5 seconds before Phase 2...")
+        controller._safe_sleep(0.5)
 
         # Phase 2: Speed 1300 for 30 seconds
         log("PHASE 2: Speed 1300, 30 seconds")

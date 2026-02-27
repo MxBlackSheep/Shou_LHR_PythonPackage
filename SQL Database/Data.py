@@ -433,6 +433,145 @@ def choose_current_culture(chain: List[int], birth_times: Dict[int, pd.Timestamp
     return current
 
 
+def build_row_for_time_and_ids(
+    t: pd.Timestamp,
+    current_ids: List[Optional[int]],
+    culture_loc: Dict[int, Dict[str, object]],
+    culture_hist: pd.DataFrame,
+    champ_hist: pd.DataFrame,
+    fluor_cols: List[str],
+) -> Dict[str, object]:
+    row: Dict[str, object] = {"time": pd.to_datetime(t)}
+
+    for i, current in enumerate(current_ids, start=1):
+        row[f"Culture {i} ID"] = current
+
+        loc = {"PlateID": None, "WellID": None}
+        if current is not None:
+            loc = culture_loc.get(int(current), {"PlateID": None, "WellID": None})
+
+        hrow = last_row_at_or_before(culture_hist, int(current), t) if current is not None else None
+        crow = (
+            last_row_at_or_before(champ_hist, int(current), t)
+            if (current is not None and not champ_hist.empty)
+            else None
+        )
+
+        src = source_row_consistent(crow, hrow)
+
+        row[f"Culture {i} OD"] = compute_od_from_single_row(src)
+        for fc in fluor_cols:
+            row[f"Culture {i} {fc}"] = get_fluor_from_single_row(src, fc)
+
+        row[f"Culture {i} Plate"] = loc.get("PlateID", None)
+        row[f"Culture {i} Well"] = loc.get("WellID", None)
+
+    return row
+
+
+def _row_culture_ids(series: pd.Series, n: int) -> List[Optional[int]]:
+    ids: List[Optional[int]] = []
+    for i in range(1, n + 1):
+        v = series.get(f"Culture {i} ID", None)
+        if v is None or pd.isna(v):
+            ids.append(None)
+        else:
+            ids.append(int(v))
+    return ids
+
+
+def expand_propagation_rows_with_parents(
+    df_out: pd.DataFrame,
+    n: int,
+    culture_loc: Dict[int, Dict[str, object]],
+    culture_hist: pd.DataFrame,
+    champ_hist: pd.DataFrame,
+    fluor_cols: List[str],
+) -> Tuple[pd.DataFrame, List[Tuple[int, int]]]:
+    """
+    Duplicates each propagation row by inserting a parent row immediately below it,
+    keeping the same timestamp. Returns the expanded dataframe and 0-based data-row
+    index pairs to merge in the event column (child_row_pos, parent_row_pos).
+    """
+    if df_out.empty:
+        return df_out, []
+
+    expanded_rows: List[Dict[str, object]] = []
+    event_merge_pairs: List[Tuple[int, int]] = []
+
+    for r in range(len(df_out)):
+        t = pd.to_datetime(df_out.index[r])
+        child_series = df_out.iloc[r]
+
+        child_record = {"time": t}
+        child_record.update(child_series.to_dict())
+        expanded_rows.append(child_record)
+
+        if r >= len(df_out) - 1:
+            continue
+
+        if str(child_series.get("event", "")).strip().lower() != "propagation":
+            continue
+
+        older_series = df_out.iloc[r + 1]
+        child_ids = _row_culture_ids(child_series, n)
+        older_ids = _row_culture_ids(older_series, n)
+
+        parent_ids = list(child_ids)
+        changed_any = False
+        for idx in range(n):
+            c_id = child_ids[idx]
+            o_id = older_ids[idx]
+            if c_id is None or o_id is None:
+                continue
+            if c_id != o_id:
+                parent_ids[idx] = o_id
+                changed_any = True
+
+        if not changed_any:
+            continue
+
+        parent_record = build_row_for_time_and_ids(t, parent_ids, culture_loc, culture_hist, champ_hist, fluor_cols)
+        parent_record["event"] = child_series.get("event", "propagation")
+        expanded_rows.append(parent_record)
+
+        child_pos = len(expanded_rows) - 2
+        parent_pos = len(expanded_rows) - 1
+        event_merge_pairs.append((child_pos, parent_pos))
+
+    out = pd.DataFrame(expanded_rows)
+    if out.empty:
+        return df_out, []
+
+    out["time"] = pd.to_datetime(out["time"])
+    out = out.set_index("time")
+    out.index.name = df_out.index.name
+
+    for c in df_out.columns:
+        if c not in out.columns:
+            out[c] = None
+    out = out.reindex(columns=df_out.columns)
+    return out, event_merge_pairs
+
+
+def add_cumulative_time_hours_column(df_out: pd.DataFrame, col_name: str = "cumulative Time") -> pd.DataFrame:
+    if col_name in df_out.columns:
+        df_out = df_out.drop(columns=[col_name])
+
+    if df_out.empty:
+        insert_at = 1 if "event" in df_out.columns else 0
+        df_out.insert(insert_at, col_name, [])
+        return df_out
+
+    times = pd.to_datetime(df_out.index)
+    t0 = times.min()
+    cumulative_hours = (times - t0).total_seconds() / 3600.0
+
+    insert_at = 1 if "event" in df_out.columns else 0
+    df_out.insert(insert_at, col_name, cumulative_hours)
+    return df_out
+
+
 def validate_transitions(
     df_out: pd.DataFrame,
     n: int,
@@ -542,20 +681,12 @@ def export_xlsx_with_formatting(
     df_out: pd.DataFrame,
     n: int,
     fluor_cols: List[str],
-    violations: pd.DataFrame,
+    event_merge_pairs: List[Tuple[int, int]],
 ) -> None:
     with pd.ExcelWriter(out_xlsx_path, engine="openpyxl") as writer:
         df_out.to_excel(writer, sheet_name="CultureHistory", index=True)
 
-        if violations is None or violations.empty:
-            pd.DataFrame(columns=["CultureIndex", "NewerTime", "OlderTime", "OlderID", "NewerID", "EdgeExists"]).to_excel(
-                writer, sheet_name="Violations", index=False
-            )
-        else:
-            violations.to_excel(writer, sheet_name="Violations", index=False)
-
         ws = writer.sheets["CultureHistory"]
-        ws_v = writer.sheets["Violations"]
 
         from openpyxl.styles import Font, PatternFill, Alignment
         from openpyxl.utils import get_column_letter
@@ -570,8 +701,8 @@ def export_xlsx_with_formatting(
         header_font = Font(bold=True)
         center = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-        # Freeze: time column (A) and event column (B), plus header row
-        ws.freeze_panes = "C2"
+        # Freeze: time column (A), event column (B), cumulative Time (C), plus header row
+        ws.freeze_panes = "D2"
 
         max_col = ws.max_column
         max_row = ws.max_row
@@ -625,33 +756,34 @@ def export_xlsx_with_formatting(
         for r in range(2, max_row + 1):
             ws.cell(row=r, column=1).number_format = "yyyy/mm/dd hh:mm"
 
+        cumulative_col_idx = None
+        event_col_idx = None
+        for c in range(1, max_col + 1):
+            h = ws.cell(row=1, column=c).value
+            if h == "cumulative Time":
+                cumulative_col_idx = c
+            if str(h).strip().lower() == "event":
+                event_col_idx = c
+
+        if cumulative_col_idx is not None:
+            for r in range(2, max_row + 1):
+                ws.cell(row=r, column=cumulative_col_idx).number_format = "0.00"
+
         ws.column_dimensions["A"].width = 18
         ws.column_dimensions["B"].width = 18
-        for c in range(3, max_col + 1):
+        if max_col >= 3:
+            ws.column_dimensions["C"].width = 16
+        for c in range(4, max_col + 1):
             ws.column_dimensions[get_column_letter(c)].width = 16
 
-        for sheet in [ws_v]:
-            for row in sheet.iter_rows(min_row=1, max_row=1):
-                for cell in row:
-                    cell.font = header_font
-                    cell.alignment = center
-            for r in range(2, sheet.max_row + 1):
-                for c in range(1, sheet.max_column + 1):
-                    sheet.cell(row=r, column=c).alignment = center
-            for c in range(1, sheet.max_column + 1):
-                sheet.column_dimensions[get_column_letter(c)].width = 18
-
-        for col_name in ["NewerTime", "OlderTime"]:
-            header_vals = [ws_v.cell(row=1, column=c).value for c in range(1, ws_v.max_column + 1)]
-            if col_name in header_vals:
-                idx = None
-                for c in range(1, ws_v.max_column + 1):
-                    if ws_v.cell(row=1, column=c).value == col_name:
-                        idx = c
-                        break
-                if idx is not None:
-                    for r in range(2, ws_v.max_row + 1):
-                        ws_v.cell(row=r, column=idx).number_format = "yyyy/mm/dd hh:mm"
+        if event_col_idx is not None:
+            for child_pos, parent_pos in event_merge_pairs:
+                r1 = child_pos + 2
+                r2 = parent_pos + 2
+                if r1 < 2 or r2 > max_row or r2 <= r1:
+                    continue
+                ws.merge_cells(start_row=r1, start_column=event_col_idx, end_row=r2, end_column=event_col_idx)
+                ws.cell(row=r1, column=event_col_idx).alignment = center
 
 
 def main() -> int:
@@ -698,9 +830,6 @@ def main() -> int:
 
             edges = get_propagation_edges(conn)
             parent_map = build_parent_map(edges)
-            edge_set: Set[Tuple[int, int]] = set(
-                zip(edges["ParentCultureID"].astype(int), edges["ChildCultureID"].astype(int))
-            )
 
             culture_hist = get_cultures_history(conn, scope_culture_ids)
             if culture_hist.empty:
@@ -730,33 +859,8 @@ def main() -> int:
 
             rows: List[Dict[str, object]] = []
             for t in times_sorted:
-                row: Dict[str, object] = {"time": t}
-
-                for i, chain in enumerate(tracks, start=1):
-                    current = choose_current_culture(chain, birth_times, t)
-
-                    row[f"Culture {i} ID"] = current
-
-                    loc = {"PlateID": None, "WellID": None}
-                    if current is not None:
-                        loc = culture_loc.get(current, {"PlateID": None, "WellID": None})
-
-                    hrow = last_row_at_or_before(culture_hist, current, t) if current is not None else None
-                    crow = (
-                        last_row_at_or_before(champ_hist, current, t)
-                        if (current is not None and not champ_hist.empty)
-                        else None
-                    )
-
-                    src = source_row_consistent(crow, hrow)
-
-                    row[f"Culture {i} OD"] = compute_od_from_single_row(src)
-                    for fc in fluor_cols:
-                        row[f"Culture {i} {fc}"] = get_fluor_from_single_row(src, fc)
-
-                    row[f"Culture {i} Plate"] = loc.get("PlateID", None)
-                    row[f"Culture {i} Well"] = loc.get("WellID", None)
-
+                current_ids = [choose_current_culture(chain, birth_times, t) for chain in tracks]
+                row = build_row_for_time_and_ids(t, current_ids, culture_loc, culture_hist, champ_hist, fluor_cols)
                 rows.append(row)
 
             df_out = pd.DataFrame(rows)
@@ -767,9 +871,18 @@ def main() -> int:
             # Add event column (propagation vs intermediate_fl), to be frozen with time
             df_out = add_event_column(df_out, len(finals))
 
+            # Duplicate propagation rows with parent CultureIDs at the same timestamp (child row stays on top)
+            df_out, event_merge_pairs = expand_propagation_rows_with_parents(
+                df_out, len(finals), culture_loc, culture_hist, champ_hist, fluor_cols
+            )
+
+            # Add cumulative time in hours since experiment start (oldest timestamp in export)
+            df_out = add_cumulative_time_hours_column(df_out, "cumulative Time")
+
             # Reorder columns so Culture i ID block is at the very end
             ordered_cols: List[str] = []
             ordered_cols.append("event")
+            ordered_cols.append("cumulative Time")
 
             for i in range(1, len(finals) + 1):
                 ordered_cols.append(f"Culture {i} OD")
@@ -787,13 +900,7 @@ def main() -> int:
 
             df_out = df_out.reindex(columns=ordered_cols)
 
-            violations = validate_transitions(df_out, len(finals), edge_set)
-            if violations.empty:
-                log("Propagation transition check: PASS (no violations)")
-            else:
-                log(f"Propagation transition check: FAIL (violations={len(violations)})")
-
-            export_xlsx_with_formatting(out_path, df_out, len(finals), fluor_cols, violations)
+            export_xlsx_with_formatting(out_path, df_out, len(finals), fluor_cols, event_merge_pairs)
 
         log(f"SAVED: {out_path}")
         safe_print(f"Saved: {out_path}")

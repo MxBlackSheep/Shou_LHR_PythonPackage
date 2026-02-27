@@ -315,7 +315,28 @@ def last_row_at_or_before(df: pd.DataFrame, culture_id: int, t: pd.Timestamp) ->
 def source_row_consistent(
     crow: Optional[pd.Series],
     hrow: Optional[pd.Series],
+    t: Optional[pd.Timestamp] = None,
+    prefer_culture_history: bool = False,
 ) -> Optional[pd.Series]:
+    # When a row exists exactly at the requested timestamp, use that source first.
+    if t is not None:
+        t_cmp = pd.to_datetime(t)
+        if hrow is not None:
+            h_ts = pd.to_datetime(hrow.get("TimeStamp", None), errors="coerce")
+            if pd.notna(h_ts) and h_ts == t_cmp:
+                return hrow
+        if crow is not None:
+            c_ts = pd.to_datetime(crow.get("TimeStamp", None), errors="coerce")
+            if pd.notna(c_ts) and c_ts == t_cmp:
+                return crow
+
+    if prefer_culture_history:
+        if hrow is not None:
+            return hrow
+        if crow is not None:
+            return crow
+        return None
+
     if crow is not None:
         return crow
     if hrow is not None:
@@ -440,6 +461,7 @@ def build_row_for_time_and_ids(
     culture_hist: pd.DataFrame,
     champ_hist: pd.DataFrame,
     fluor_cols: List[str],
+    prefer_culture_history: bool = False,
 ) -> Dict[str, object]:
     row: Dict[str, object] = {"time": pd.to_datetime(t)}
 
@@ -457,7 +479,7 @@ def build_row_for_time_and_ids(
             else None
         )
 
-        src = source_row_consistent(crow, hrow)
+        src = source_row_consistent(crow, hrow, t=t, prefer_culture_history=prefer_culture_history)
 
         row[f"Culture {i} OD"] = compute_od_from_single_row(src)
         for fc in fluor_cols:
@@ -483,14 +505,16 @@ def _row_culture_ids(series: pd.Series, n: int) -> List[Optional[int]]:
 def expand_propagation_rows_with_parents(
     df_out: pd.DataFrame,
     n: int,
+    parent_map: Dict[int, List[int]],
     culture_loc: Dict[int, Dict[str, object]],
     culture_hist: pd.DataFrame,
     champ_hist: pd.DataFrame,
     fluor_cols: List[str],
 ) -> Tuple[pd.DataFrame, List[Tuple[int, int]]]:
     """
-    Duplicates each propagation row by inserting a parent row immediately below it,
-    keeping the same timestamp. Returns the expanded dataframe and 0-based data-row
+    Duplicates each propagation row by inserting a parent row immediately below it.
+    Parent IDs are resolved from Propagation (child -> parent) first, then adjacent-row
+    fallback is used if needed. Returns the expanded dataframe and 0-based data-row
     index pairs to merge in the event column (child_row_pos, parent_row_pos).
     """
     if df_out.empty:
@@ -522,16 +546,39 @@ def expand_propagation_rows_with_parents(
         for idx in range(n):
             c_id = child_ids[idx]
             o_id = older_ids[idx]
-            if c_id is None or o_id is None:
+            if c_id is None:
+                continue
+
+            mapped_parent: Optional[int] = None
+            parents = parent_map.get(int(c_id), [])
+            if parents:
+                mapped_parent = int(parents[0])
+
+            if mapped_parent is not None:
+                if mapped_parent != c_id:
+                    parent_ids[idx] = mapped_parent
+                    changed_any = True
+                    continue
+                # If mapping resolves to self unexpectedly, keep older-row fallback.
+
+            if o_id is None:
                 continue
             if c_id != o_id:
-                parent_ids[idx] = o_id
+                parent_ids[idx] = int(o_id)
                 changed_any = True
 
         if not changed_any:
             continue
 
-        parent_record = build_row_for_time_and_ids(t, parent_ids, culture_loc, culture_hist, champ_hist, fluor_cols)
+        parent_record = build_row_for_time_and_ids(
+            t,
+            parent_ids,
+            culture_loc,
+            culture_hist,
+            champ_hist,
+            fluor_cols,
+            prefer_culture_history=True,
+        )
         parent_record["event"] = child_series.get("event", "propagation")
         expanded_rows.append(parent_record)
 
@@ -873,7 +920,7 @@ def main() -> int:
 
             # Duplicate propagation rows with parent CultureIDs at the same timestamp (child row stays on top)
             df_out, event_merge_pairs = expand_propagation_rows_with_parents(
-                df_out, len(finals), culture_loc, culture_hist, champ_hist, fluor_cols
+                df_out, len(finals), parent_map, culture_loc, culture_hist, champ_hist, fluor_cols
             )
 
             # Add cumulative time in hours since experiment start (oldest timestamp in export)

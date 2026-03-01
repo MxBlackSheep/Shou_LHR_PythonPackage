@@ -61,7 +61,7 @@ def log(msg: str) -> None:
 
 # === Constants ===
 TARGET_OD = 0.3
-PREDICT_WITHIN_HOURS = 2.0
+PREDICT_WITHIN_HOURS = 3.0
 ROUND_MINUTES = 10
 
 # Only consider the three most recent readings per culture

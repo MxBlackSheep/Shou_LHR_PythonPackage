@@ -37,7 +37,7 @@ venv/
 env/
 ENV/
 
-# Unit test / coverage
+# Unit test_Sonal_MeasureAndDilution / coverage
 .coverage
 .coverage.*
 .cache

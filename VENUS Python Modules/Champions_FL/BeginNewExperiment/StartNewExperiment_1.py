@@ -1,33 +1,71 @@
+"""Set up a Champions experiment: collect input, create records and write task files."""
+
+import argparse
+import os
+import sys
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from datetime import datetime
-import pyodbc
-import os
-import pandas as pd
-import argparse
-import sys
 
-# === Setup logging ===
-log_dir = r"C:\Python Log"
-os.makedirs(log_dir, exist_ok=True)
-script_name = os.path.splitext(os.path.basename(sys.argv[0]))[0]
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-log_file = os.path.join(log_dir, f"{script_name}_{timestamp}.log")
+from hamilton_workflows.config import Settings
+from hamilton_workflows.runtime import RunLogger, run_logged
+from hamilton_workflows import database
+from hamilton_workflows.plate_patterns import process_excel_to_well_assignment
+from hamilton_workflows.task_files import task_path, write_text
 
-def log(message):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(log_file, "a") as f:
-        f.write(f"[{now}] {message}\n")
 
-# === Parse CLI Arguments ===
-def parse_args():
-    parser = argparse.ArgumentParser(description="Launch experiment setup GUI.")
-    parser.add_argument("barcode1", type=str, help="New Plate Barcode identifier")
-    parser.add_argument("barcode2", type=str, help="Expansion Plate Barcode identifier")
-    return parser.parse_args()
+def create_experiment(user_id, note, schedule, parameters, barcode1, barcode2, excel_file, settings, log):
+    with database.connection(settings) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO Experiments (UserDefinedID, Note, ScheduledToRun) VALUES (?, ?, ?)",
+            (user_id, note, schedule),
+        )
+        experiment_id = database.fetch_one_value(
+            cursor, "SELECT ExperimentID FROM Experiments WHERE UserDefinedID = ?", (user_id,)
+        )
+        if experiment_id is None:
+            raise RuntimeError(f"Could not retrieve ExperimentID for UserDefinedID={user_id}")
+        for name, value in parameters.items():
+            cursor.execute(
+                "INSERT INTO ExperimentParameters (ExperimentID, ParameterName, ParamValueTxt) VALUES (?, ?, ?)",
+                (experiment_id, name, value),
+            )
+        cursor.execute(
+            "EXEC SpatialEvo_NewExperiment @UserExpID = ?, @NewPlateBC = ?, @ExpandPlateBC = ?",
+            user_id, barcode1, barcode2,
+        )
+        result = cursor.fetchone()
+        if result and "DATABASE ERROR" in str(result[0]):
+            raise RuntimeError(f"Stored proc error: {result[0]}")
+        if result is None:
+            raise RuntimeError("SpatialEvo_NewExperiment returned no plate information.")
+        plate_id, cytomat_pos = result
+        expansion_pos = database.fetch_one_value(cursor, "SELECT dbo.QueryCytomatPosition(?)", (barcode2,))
+        run_id = database.latest_run_id(cursor)
+        log(f"Retrieved RunGUID: {run_id}; PlateID: {plate_id}; Cytomat Position: {cytomat_pos}")
+
+        for suffix, value in (("PlateID", plate_id), ("CytomatPos", cytomat_pos), ("ExpansionCytomatPos", expansion_pos)):
+            if value is not None:
+                path = task_path(settings.task_dir, run_id, suffix)
+                write_text(path, value)
+                log(f"Written {suffix} to {path}")
+
+        frame = process_excel_to_well_assignment(excel_file, run_id, plate_id)
+        data = list(frame.itertuples(index=False, name=None))
+        cursor.executemany(
+            "INSERT INTO ImportPlatePattern (PlateID, WellID, RunID, WellAssign) VALUES (?, ?, ?, ?)", data
+        )
+        frame.to_csv("output.txt", sep="\t", index=False)
+        log(f"Inserted {len(data)} rows into ImportPlatePattern and wrote output.txt.")
+        conn.commit()
+    log("Experiment creation complete.")
+    return plate_id, cytomat_pos
+
 
 class InputForm:
-    def __init__(self, root, barcode1, barcode2):
+    def __init__(self, root, barcode1, barcode2, settings, log):
+        self.settings = settings
+        self.log = log
         self.root = root
         self.barcode1 = barcode1
         self.barcode2 = barcode2
@@ -96,53 +134,14 @@ class InputForm:
         ttk.Button(self.frame, text="Submit", command=self.validate_and_submit).grid(row=5, column=0, columnspan=3, pady=10)
 
     def on_close(self):
-        log("User closed the GUI window without submitting.")
+        self.log("User closed the GUI window without submitting.")
         sys.exit(1)
 
     def browse_excel(self):
         filename = filedialog.askopenfilename(title="Select Excel File", filetypes=[("Excel files", "*.xlsx *.xls")])
         if filename:
             self.excel_path.set(filename)
-            log(f"Excel file selected: {filename}")
-
-    def establish_connection(self):
-        log("Establishing database connection...")
-        conn = pyodbc.connect(
-            "DRIVER={ODBC Driver 11 for SQL Server};"
-            "SERVER=LOCALHOST\\HAMILTON;"
-            "DATABASE=EvoYeast;"
-            "UID=Hamilton;"
-            "PWD=mkdpw:V43;"
-            "Trust_Connection=no;"
-        )
-        log("Database connection established.")
-        return conn
-
-    def get_runID(self):
-        conn = self.establish_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT TOP 1 RunGUID FROM HamiltonVectorDB.dbo.HxRun ORDER BY StartTime DESC")
-        run_id = cursor.fetchone()[0]
-        log(f"Retrieved RunGUID: {run_id}")
-        conn.commit()
-        conn.close()
-        return run_id
-
-    def process_excel_to_well_assignment(self, excel_file, runid, plateid):
-        df = pd.read_excel(excel_file, header=1).dropna(subset=["Destination", "Source"])
-        if not {"Destination", "Source", "Vol"}.issubset(df.columns):
-            raise ValueError("Excel file missing required columns")
-
-        df["Destination"] = df["Destination"].astype(str).str.strip()
-        df["Source"] = df["Source"].astype(str).str.strip()
-
-        log(f"Processing {len(df)} rows from Excel.")
-        return pd.DataFrame({
-            "plateid": plateid,
-            "wellID": df["Destination"],
-            "runid": runid,
-            "WellAssign": df["Source"].apply(lambda x: "MediaCtrl" if x == "T" else "Cells")
-        })
+            self.log(f"Excel file selected: {filename}")
 
     def validate_and_submit(self):
         try:
@@ -151,113 +150,36 @@ class InputForm:
                 raise ValueError("UserDefinedID is required")
             note = self.note.get().strip()
             schedule = self.schedule.get().strip() or "0"
-
             excel_file = self.excel_path.get()
             if not os.path.exists(excel_file):
                 raise FileNotFoundError("Excel file not selected or does not exist")
-
-            parameters = {}
-            for param, entry in self.param_entries.items():
-                value = float(entry.get().strip())
-                parameters[param] = value
-
-            conn = self.establish_connection()
-            cursor = conn.cursor()
-
-            cursor.execute("INSERT INTO Experiments (UserDefinedID, Note, ScheduledToRun) VALUES (?, ?, ?)",
-                           (user_id, note, schedule))
-            log(f"Inserted Experiment: {user_id}, Schedule={schedule}")
-
-            cursor.execute("SELECT ExperimentID FROM Experiments WHERE UserDefinedID = ?", (user_id,))
-            experiment_id = cursor.fetchone()[0]
-
-            for param_name, param_value in parameters.items():
-                cursor.execute("INSERT INTO ExperimentParameters (ExperimentID, ParameterName, ParamValueTxt) VALUES (?, ?, ?)",
-                               (experiment_id, param_name, param_value))
-
-            cursor.execute("EXEC SpatialEvo_NewExperiment @UserExpID = ?, @NewPlateBC = ?, @ExpandPlateBC = ?",
-                           user_id, self.barcode1, self.barcode2)
-            result = cursor.fetchone()
-            if result and "DATABASE ERROR" in str(result[0]):
-                log(f"Stored proc error: {result[0]}")
-                sys.exit(1)
-
-            plate_id, cytomat_pos = result
-            log(f"PlateID: {plate_id}, Cytomat Position: {cytomat_pos}")
-
-            # Fixed SQL query - barcode2 should use self.barcode2
-            cursor.execute("SELECT dbo.QueryCytomatPosition(?)", (self.barcode2,))
-            expansion_plate_cytomatPos_result = cursor.fetchone()
-            # Handle potential None result and extract just the position value
-            if expansion_plate_cytomatPos_result:
-                # The result is (2,) so we need the first element
-                expansion_plate_cytomatPos = expansion_plate_cytomatPos_result[0]
-                log(f"Expansion plate cytomat position: {expansion_plate_cytomatPos}")
-            else:
-                log("Warning: No expansion plate cytomat position found")
-                expansion_plate_cytomatPos = None
-
-            run_id = self.get_runID()
-
-            # Write values to files
-            try:
-                # Write PlateID to file
-                plate_id_path = f"C:\\EvoTaskFiles\\{run_id}_PlateID.txt"
-                with open(plate_id_path, 'w') as f:
-                    f.write(str(plate_id))
-                log(f"Written PlateID to {plate_id_path}")
-
-                # Write cytomat_pos to file
-                cytomat_pos_path = f"C:\\EvoTaskFiles\\{run_id}_CytomatPos.txt"
-                with open(cytomat_pos_path, 'w') as f:
-                    f.write(str(cytomat_pos))
-                log(f"Written Cytomat Position to {cytomat_pos_path}")
-
-                # Write expansion_plate_cytomatPos to file
-                if expansion_plate_cytomatPos is not None:
-                    expansion_cytomat_path = f"C:\\EvoTaskFiles\\{run_id}_ExpansionCytomatPos.txt"
-                    with open(expansion_cytomat_path, 'w') as f:
-                        f.write(str(expansion_plate_cytomatPos))
-                    log(f"Written Expansion Cytomat Position to {expansion_cytomat_path}")
-                else:
-                    log("Skipping expansion cytomat position file write - value is None")
-
-            except IOError as e:
-                log(f"Error writing to EvoTaskFiles: {e}")
-                sys.exit(1)
-
-            processed_df = self.process_excel_to_well_assignment(excel_file, run_id, plate_id)
-            data = list(processed_df.itertuples(index=False, name=None))
-            cursor.executemany(
-                "INSERT INTO ImportPlatePattern (PlateID, WellID, RunID, WellAssign) VALUES (?, ?, ?, ?)", data)
-            log(f"Inserted {len(data)} rows into ImportPlatePattern")
-
-            processed_df.to_csv("output.txt", sep="\t", index=False)
-            log(f"Wrote output.txt with {len(processed_df)} rows.")
-
-            conn.commit()
-            conn.close()
-
+            parameters = {name: float(entry.get().strip()) for name, entry in self.param_entries.items()}
+            create_experiment(
+                user_id, note, schedule, parameters, self.barcode1, self.barcode2,
+                excel_file, self.settings, self.log,
+            )
             messagebox.showinfo("Success", "Experiment Has Been Created")
-            log("Experiment creation complete.")
             self.root.destroy()
             sys.exit(0)
-
-        except Exception as e:
-            log(f"Validation or DB error: {e}")
+        except Exception as error:
+            self.log(f"Validation or DB error: {error}")
             sys.exit(1)
 
-# === Main Application ===
-if __name__ == "__main__":
-    try:
-        args = parse_args()
-        barcode1 = args.barcode1
-        barcode2 = args.barcode2
 
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Launch experiment setup GUI.")
+    parser.add_argument("barcode1", type=str, help="New Plate Barcode identifier")
+    parser.add_argument("barcode2", type=str, help="Expansion Plate Barcode identifier")
+    args = parser.parse_args(argv)
+    settings = Settings.from_env()
+    log = RunLogger(settings.log_dir)
+
+    def launch():
         root = tk.Tk()
-        app = InputForm(root, barcode1, barcode2)
+        InputForm(root, args.barcode1, args.barcode2, settings, log)
         root.mainloop()
 
-    except Exception as e:
-        log(f"Unhandled exception: {e}")
-        sys.exit(1)
+    return run_logged(launch, log)
+
+if __name__ == "__main__":
+    raise SystemExit(main())

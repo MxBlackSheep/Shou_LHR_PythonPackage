@@ -1,72 +1,34 @@
+"""Commence the experiment after its initial fluorescence upload."""
+
 import pyodbc
-import os
-import sys
-from datetime import datetime
 
-# === Set up log file ===
-log_dir = r"C:\Python Log"
-os.makedirs(log_dir, exist_ok=True)
-script_name = os.path.splitext(os.path.basename(sys.argv[0]))[0]
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-log_file = os.path.join(log_dir, f"{script_name}_{timestamp}.log")
+from hamilton_workflows import database
+from hamilton_workflows.config import Settings
+from hamilton_workflows.runtime import RunLogger, run_logged
 
-def log(message):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(log_file, "a") as f:
-        f.write(f"[{now}] {message}\n")
 
-def establish_connection():
-    server_name = 'LOCALHOST\\HAMILTON'
-    database_name = 'EvoYeast'
-    username = 'Hamilton'
-    password = 'mkdpw:V43'
-    connection_string = (
-        f"DRIVER={{ODBC Driver 11 for SQL Server}};"
-        f"SERVER={server_name};"
-        f"DATABASE={database_name};"
-        f"UID={username};"
-        f"PWD={password};"
-        f"Trust_Connection=no;"
-    )
-    return pyodbc.connect(connection_string)
-
-def main():
-    try:
-        log("Establishing connection...")
-        conn = establish_connection()
+def commence_experiment(settings, log):
+    with database.connection(settings) as conn:
         cursor = conn.cursor()
-        log("Connected to database.")
-
-        # Get PlateID
-        cursor.execute("SELECT TOP 1 PlateID FROM AncestPlatesInExperiments ORDER BY ExperimentID DESC")
-        plateID = cursor.fetchone()[0]
-        log(f"Retrieved PlateID: {plateID}")
-
-        # Call stored procedure
-        cursor.execute("EXEC SpatialEvo_CommenceExperimentFl @PlateID = ?", plateID)
+        plate_id = database.latest_ancestor_plate_id(cursor)
+        log(f"Retrieved PlateID: {plate_id}")
+        cursor.execute("EXEC SpatialEvo_CommenceExperimentFl @PlateID = ?", plate_id)
         try:
             result = cursor.fetchone()
         except pyodbc.ProgrammingError:
             result = None
-            log("No result returned from stored procedure.")
-
-        if result:
-            if isinstance(result[0], str) and "DATABASE ERROR" in result[0]:
-                log(f"Stored procedure returned error: {result[0]}")
-                sys.exit(1)
-            else:
-                log(f"Stored procedure returned: {result}")
-        else:
-            log("Stored procedure completed successfully with no result.")
-
+        if result and isinstance(result[0], str) and "DATABASE ERROR" in result[0]:
+            raise RuntimeError(f"Stored procedure returned error: {result[0]}")
+        log(f"Stored procedure returned: {result}")
         conn.commit()
-        conn.close()
-        log("Connection closed. Script completed successfully.")
-        sys.exit(0)
+    log("Connection closed. Script completed successfully.")
 
-    except Exception as e:
-        log(f"Fatal error: {e}")
-        sys.exit(1)
+
+def main(argv=None):
+    # VENUS passes two barcodes, which this step has always ignored.
+    settings = Settings.from_env()
+    log = RunLogger(settings.log_dir)
+    return run_logged(lambda: commence_experiment(settings, log), log)
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

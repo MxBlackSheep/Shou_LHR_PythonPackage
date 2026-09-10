@@ -1,5 +1,18 @@
 # Python Modules for Champions_FL Workflow.
 
+## 20260910
+
+- The eight Python files retain their workflow logic, argument parsing, GUI and
+  entry points. They import reusable utilities from `hamilton_workflows` under `src`.
+- Shared logging, SQL connections/lookups, Gen5 parsing, fluorescence simulation,
+  BCP imports, Excel assignments and task/sequence writers have been extracted.
+- Existing executable names, CLI arguments, SQL procedure calls and output file
+  contracts are retained. Imports no longer start workflows.
+- Experiment creation, plate selection, propagation rules, channel selection and
+  transaction boundaries remain visible in the original scripts.
+- See the [shared utilities](../../src/hamilton_workflows/) and the
+  [setup, tests and build commands](../../README.md).
+
 ## 20251017
 
 - Replace StartNewExperiment_SimulationFlourscent and ContinoueOnGoingExperiment_SimulationFlourscent with a uniformed SendGFPAndRFPToDB.

@@ -1,94 +1,77 @@
-"""Select cultures, run Champions propagation, and export aligned VENUS files."""
+"""Plan Champions propagation in Python and export aligned VENUS transfers."""
 
 import argparse
 
-from hamilton_workflows import bcp, database
+from hamilton_workflows import database, propagation_store as store
 from hamilton_workflows.config import Settings
+from hamilton_workflows.propagation import calculate_plan, serialize_plan
+from hamilton_workflows.propagation_files import stage_files, publish_files
 from hamilton_workflows.runtime import RunLogger, run_logged
-from hamilton_workflows.task_files import task_path, write_hamilton_sequence, write_plain_lines, write_tsv_rows
 
 
-def is_dummy_propagation_row(row):
-    return len(row) >= 7 and tuple(row[:7]) == (0, None, None, None, 0, 0, 0)
-
-
-def write_propagation_files(rows, run_id, source_labware, spillover_labware, settings):
-    if not rows:
-        raise RuntimeError("No usable propagation data returned from Champions_CommencePropagationFl.")
-    cytomat = [str(row[0]) for row in rows if row[0] is not None]
-    spill_positions = [str(row[2]) for row in rows]
-    source_positions = [str(row[3]) for row in rows]
-    culture_volumes = [str(row[4]) for row in rows]
-    media_volumes = [str(row[5]) for row in rows]
-
-    write_plain_lines(task_path(settings.task_dir, run_id, "CytomatPos"), cytomat)
-    write_hamilton_sequence(
-        task_path(settings.task_dir, run_id, "SpillOverPlate_Positions"),
-        spill_positions, spillover_labware, "seqSpillOverPlate", settings.layout_path,
-    )
-    write_hamilton_sequence(
-        task_path(settings.task_dir, run_id, "SpatialOverPlate_Positions"),
-        source_positions, source_labware, "seqEvoSrcPlate", settings.layout_path,
-    )
-    write_plain_lines(task_path(settings.task_dir, run_id, "CultureVol"), culture_volumes)
-    write_plain_lines(task_path(settings.task_dir, run_id, "MediaVol"), media_volumes)
-
-
-def read_experiment_parameters(cursor, names):
-    parameters = {}
-    for name in names:
-        value = database.fetch_one_value(cursor, "SELECT dbo.ReadExperimentParameter(NULL, ?)", (name,))
-        if value is None:
-            raise RuntimeError(f"Parameter {name} missing.")
-        parameters[name] = float(value)
-    return parameters
-
-
-def propagate(barcode, source_labware, spillover_labware, settings, log):
+def propagate(barcode, source_labware, spillover_labware, settings, log, *, run_id=None, dry_run=False):
     with database.connection(settings) as conn:
         cursor = conn.cursor()
-        run_id = database.latest_run_id(cursor)
-        log(f"Latest RunGUID retrieved: {run_id}")
-        cursor.execute(
-            "EXEC dbo.Competition_SelectCultures @Barcode = ?, @RunID = ?", (barcode, run_id)
-        )
-        cultures = cursor.fetchall()
-        if not cultures:
-            raise RuntimeError("No data returned from Competition_SelectCultures.")
-        subset_path = task_path(settings.task_dir, run_id, "subset")
-        write_tsv_rows(subset_path, [[row[0], run_id, row[1], 1] for row in cultures])
-        bcp.run_bcp("ImportSpatialEvoODSubset", subset_path, settings, log=log)
-
-        params = read_experiment_parameters(
-            cursor, ("TargetWellVolume", "InoculationOD", "TopFractionToPropagate", "V_OD_Sample")
-        )
-        for name, value in params.items():
-            log(f"Parameter loaded: {name} = {value}")
-        cursor.execute(
-            "EXEC dbo.Champions_CommencePropagationFl "
-            "@TargetVol=?, @RunId=?, @InoculationOD=?, @TopFractionToPropagate=?, @ODSampleVol=?",
-            (params["TargetWellVolume"], run_id, params["InoculationOD"],
-             params["TopFractionToPropagate"], params["V_OD_Sample"]),
-        )
-        rows = database.fetch_all_result_sets(cursor, skip_row=is_dummy_propagation_row, log=log)
-        # Preserve the stored-procedure commit before exporting the files.
-        conn.commit()
-        write_propagation_files(rows, run_id, source_labware, spillover_labware, settings)
-    log("All files generated successfully. === Script completed ===")
+        # Do not hold serializable lineage locks while waiting for another
+        # planner's application lock: that would block its eventual inserts.
+        cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED; SET XACT_ABORT ON;")
+        run_id = run_id or database.latest_run_id(cursor)
+        context = store.load_context(cursor, barcode, run_id)
+        export = {"source_labware": source_labware, "spillover_labware": spillover_labware,
+                  "layout_path": settings.layout_path}
+        log(f"Planning source plate {context['source_plate_id']} for run {run_id}.")
+        try:
+            store.acquire_locks(cursor, context)
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;")
+            if store.load_context(cursor, barcode, run_id) != context:
+                raise RuntimeError("Experiment/source context changed while acquiring propagation locks.")
+            plan = calculate_plan(store.load_snapshot(cursor, context), **export)
+            if dry_run:
+                report = serialize_plan(plan)
+                print(report)
+                log(f"Dry-run plan (no database or VENUS output writes): {report}")
+                return plan
+            with stage_files(plan, settings.task_dir) as paths:
+                store.persist_plan(cursor, plan)
+                conn.commit()
+                try:
+                    publish_files(paths, settings.task_dir)
+                except Exception as error:
+                    raise RuntimeError(
+                        f"Database committed but output publication failed for run {run_id}, source {barcode}. "
+                        "Stop VENUS. Do not rerun propagation: database writes have committed. Manual reconciliation of database records, output files and physical transfers is required."
+                    ) from error
+            log(f"Published {len(plan['transfers'])} transfers. Physical transfer completion is tracked by VENUS.")
+            return plan
+        finally:
+            # Release the session-owned lock explicitly even with ODBC pooling.
+            conn.rollback()
+            try:
+                cursor.execute("""
+                    DECLARE @result int;
+                    EXEC @result=sys.sp_releaseapplock @Resource=?, @LockOwner='Session';
+                    SELECT @result;
+                """, (f"ChampionsExport:{run_id}",))
+                cursor.fetchone()
+            finally:
+                cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED;")
+                conn.rollback()
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("PlateChainBarcode", type=str, help="PlateChainBarcode identifier")
-    parser.add_argument("SpatialEvoPlateID", type=str, help="SpatialEvoPlateID identifier")
-    parser.add_argument("SpillOverPlateID", type=str, help="SpillOverPlateID identifier")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("PlateChainBarcode", help="Source plate barcode")
+    parser.add_argument("SpatialEvoPlateID", help="Source VENUS labware identifier")
+    parser.add_argument("SpillOverPlateID", help="Destination VENUS labware identifier")
+    parser.add_argument("--run-id", help="Explicit Hamilton run ID; defaults to the latest run")
+    parser.add_argument("--dry-run", action="store_true", help="Report the plan without database or VENUS output writes")
     args = parser.parse_args(argv)
     settings = Settings.from_env()
     log = RunLogger(settings.log_dir)
-    return run_logged(
-        lambda: propagate(args.PlateChainBarcode, args.SpatialEvoPlateID, args.SpillOverPlateID, settings, log),
-        log,
-    )
+    return run_logged(lambda: propagate(
+        args.PlateChainBarcode, args.SpatialEvoPlateID, args.SpillOverPlateID, settings, log,
+        run_id=args.run_id, dry_run=args.dry_run), log)
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

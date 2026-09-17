@@ -1,5 +1,15 @@
 # Python Modules for Champions_FL Workflow.
 
+## 20260915
+
+- Champions propagation selection, fluorescence calculations, deterministic well
+  allocation and transfer volumes now run in Python. Supported fractions are
+  25%, 50%, and 100%, with exact splits and one destination plate per invocation.
+- Biological records commit transactionally using existing tables; no migration
+  is required. Repeat calls after commit are rejected. Export failures after
+  commit require manual reconciliation. See
+  [propagation deployment and recovery](../../docs/champions-propagation.md).
+
 ## 20260910
 
 - The eight Python files retain their workflow logic, argument parsing, GUI and

@@ -159,52 +159,13 @@ class ChampionsContracts(unittest.TestCase):
         self.assertFalse(self.settings.task_dir.exists())
         conn.close.assert_called_once()
 
-    def test_propagation_collects_all_sets_and_preserves_paired_sequences(self):
-        cursor, conn = self.connect_script([
-            ('SELECT TOP 1 RunGUID', [[('run',)]]),
-            ('EXEC dbo.Competition_SelectCultures', [[(1, 'A1'), (1, 'B1')]]),
-            ('SELECT dbo.ReadExperimentParameter', [[(700,)]]),
-            ('SELECT dbo.ReadExperimentParameter', [[(0.03,)]]),
-            ('SELECT dbo.ReadExperimentParameter', [[(0.5,)]]),
-            ('SELECT dbo.ReadExperimentParameter', [[(150,)]]),
-            ('EXEC dbo.Champions_CommencePropagationFl', [
-                [(4, 'child', 'A1', 'B1', 20.0, 680.0, 9)],
-                pyodbc.ProgrammingError('no rows'),
-                [(4, 'child', 'C1', 'D1', 30.0, 670.0, 9)],
-                [(0, None, None, None, 0, 0, 0)],
-            ]),
-        ])
-        with patch.object(bcp, 'run_bcp') as upload:
-            propagation.propagate('barcode', 'source', 'spill', self.settings, self.log)
-        self.assertEqual(upload.call_args.args[0], 'ImportSpatialEvoODSubset')
-        self.assertEqual((self.settings.task_dir / 'run_subset.txt').read_bytes(), b'1\trun\tA1\t1\r\n1\trun\tB1\t1\r\n')
-        self.assertEqual((self.settings.task_dir / 'run_CultureVol.txt').read_bytes(), b'20.0\r\n30.0')
-        self.assertEqual((self.settings.task_dir / 'run_MediaVol.txt').read_bytes(), b'680.0\r\n670.0')
-        self.assertEqual((self.settings.task_dir / 'run_CytomatPos.txt').read_bytes(), b'4\r\n4')
-        self.assertEqual((self.settings.task_dir / 'run_SpillOverPlate_Positions.txt').read_bytes(),
-            b'Id,Layout,Sequence,Labware,Position\n1,layout,seqSpillOverPlate,spill,A1\n2,layout,seqSpillOverPlate,spill,C1\n')
-        self.assertEqual((self.settings.task_dir / 'run_SpatialOverPlate_Positions.txt').read_bytes(),
-            b'Id,Layout,Sequence,Labware,Position\n1,layout,seqEvoSrcPlate,source,B1\n2,layout,seqEvoSrcPlate,source,D1\n')
-        self.assertEqual(cursor.calls[-1][1], ((700.0, 'run', 0.03, 0.5, 150.0),))
-        self.assertFalse(cursor.steps)
-        conn.commit.assert_called_once()
-        conn.close.assert_called_once()
-
-    def test_dummy_filter_does_not_remove_other_zero_rows(self):
-        self.assertTrue(propagation.is_dummy_propagation_row((0, None, None, None, 0, 0, 0)))
-        self.assertFalse(propagation.is_dummy_propagation_row((0, 'BC', 'A1', 'B1', 0, 0, 0)))
-
-    def test_failed_bcp_stops_before_propagation_and_closes_connection(self):
-        cursor, conn = self.connect_script([
-            ('SELECT TOP 1 RunGUID', [[('run',)]]),
-            ('EXEC dbo.Competition_SelectCultures', [[(1, 'A1')]]),
-        ])
-        with patch.object(bcp, 'run_bcp', side_effect=RuntimeError('BCP failed')):
-            with self.assertRaisesRegex(RuntimeError, 'BCP failed'):
-                propagation.propagate('barcode', 'source', 'spill', self.settings, self.log)
-        conn.commit.assert_not_called()
-        conn.rollback.assert_called_once()
-        conn.close.assert_called_once()
+    def test_setup_rejects_unsupported_fraction_before_connecting(self):
+        for fraction in (None, 0.75, 0.125, float('nan')):
+            with patch.object(database, 'connect') as connect:
+                with self.assertRaises(ValueError):
+                    setup.create_experiment('user', '', '1', {'TopFractionToPropagate': fraction},
+                                            'parent', 'expansion', 'file', self.settings, self.log)
+                connect.assert_not_called()
 
     def test_upload_real_and_test_mode_payloads(self):
         for test_mode in (False, True):
@@ -262,7 +223,8 @@ class ChampionsContracts(unittest.TestCase):
     def test_setup_keeps_parameters_barcodes_assignment_and_output_contract(self):
         cursor, conn = self.connect_script([
             ('INSERT INTO Experiments', []), ('SELECT ExperimentID', [[(5,)]]),
-            ('INSERT INTO ExperimentParameters', []), ('EXEC SpatialEvo_NewExperiment', [[(12, 3)]]),
+            ('INSERT INTO ExperimentParameters', []), ('INSERT INTO ExperimentParameters', []),
+            ('EXEC SpatialEvo_NewExperiment', [[(12, 3)]]),
             ('SELECT dbo.QueryCytomatPosition', [[(4,)]]), ('SELECT TOP 1 RunGUID', [[('run',)]]),
             ('INSERT INTO ImportPlatePattern', []),
         ])
@@ -270,13 +232,13 @@ class ChampionsContracts(unittest.TestCase):
         try:
             os.chdir(self.root)
             with patch.object(pd, 'read_excel', return_value=pd.DataFrame({'Destination': ['A1'], 'Source': ['T'], 'Vol': [1]})):
-                result = setup.create_experiment('user', 'note', '1', {'TargetWellVolume': 700},
+                result = setup.create_experiment('user', 'note', '1', {'TargetWellVolume': 700, 'TopFractionToPropagate': 1},
                     'parent', 'expansion', 'file', self.settings, self.log)
         finally:
             os.chdir(previous)
         self.assertEqual(result, (12, 3))
-        self.assertEqual(cursor.calls[3][1], ('user', 'parent', 'expansion'))
-        self.assertEqual(cursor.calls[4][1], (('expansion',),))
+        self.assertEqual(cursor.calls[4][1], ('user', 'parent', 'expansion'))
+        self.assertEqual(cursor.calls[5][1], (('expansion',),))
         self.assertEqual(cursor.calls[-1][1], ([(12, 'A1', 'run', 'MediaCtrl')],))
         for suffix, contents in [('PlateID', b'12'), ('CytomatPos', b'3'), ('ExpansionCytomatPos', b'4')]:
             self.assertEqual((self.settings.task_dir / f'run_{suffix}.txt').read_bytes(), contents)
@@ -287,10 +249,11 @@ class ChampionsContracts(unittest.TestCase):
     def test_setup_sql_error_rolls_back_without_success_outputs(self):
         _, conn = self.connect_script([
             ('INSERT INTO Experiments', []), ('SELECT ExperimentID', [[(5,)]]),
+            ('INSERT INTO ExperimentParameters', []),
             ('EXEC SpatialEvo_NewExperiment', [[('DATABASE ERROR: conflict',)]]),
         ])
         with self.assertRaisesRegex(RuntimeError, 'DATABASE ERROR'):
-            setup.create_experiment('user', '', '1', {}, 'parent', 'expansion', 'file', self.settings, self.log)
+            setup.create_experiment('user', '', '1', {'TopFractionToPropagate': 1}, 'parent', 'expansion', 'file', self.settings, self.log)
         conn.commit.assert_not_called()
         conn.rollback.assert_called_once()
         conn.close.assert_called_once()

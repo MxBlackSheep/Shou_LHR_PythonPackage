@@ -10,10 +10,13 @@ from hamilton_workflows.config import Settings
 from hamilton_workflows.runtime import RunLogger, run_logged
 from hamilton_workflows import database
 from hamilton_workflows.plate_patterns import process_excel_to_well_assignment
+from hamilton_workflows.propagation import PROPAGATION_FRACTIONS, validate_fraction
 from hamilton_workflows.task_files import task_path, write_text
 
 
 def create_experiment(user_id, note, schedule, parameters, barcode1, barcode2, excel_file, settings, log):
+    # Validate before the first database write, including non-GUI callers.
+    validate_fraction(parameters.get('TopFractionToPropagate'))
     with database.connection(settings) as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -123,7 +126,7 @@ class InputForm:
             col = i % 2 * 2
             ttk.Label(param_frame, text=f"{param}:").grid(row=row, column=col, sticky=tk.W, padx=5)
             if param == 'TopFractionToPropagate':
-                entry = ttk.Combobox(param_frame, values=["0.25", "0.5", "0.75", "1"], state="readonly", width=18)
+                entry = ttk.Combobox(param_frame, values=[f"{v:g}" for v in PROPAGATION_FRACTIONS], state="readonly", width=18)
                 entry.set(str(default))
             else:
                 entry = ttk.Entry(param_frame, width=20)

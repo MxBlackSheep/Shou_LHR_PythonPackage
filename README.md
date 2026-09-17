@@ -80,6 +80,7 @@ Normal setup, runs and builds use `--locked` to preserve the recorded versions.
 
 - [Shared utilities](src/hamilton_workflows/)
 - [Champions workflow notes](VENUS%20Python%20Modules/Champions_FL/Champions_FL.md)
+- [Python propagation and failure handling](docs/champions-propagation.md)
 - [Teleshake hardware control](Labwares/Teleshake/Teleshake.md)
 - VENUS method backups: [Champions_FL_Python](VENUS-Method/Champions_FL_Python/),
   [ChamFL_Flourscent](VENUS-Method/ChamFL_Flourscent/)

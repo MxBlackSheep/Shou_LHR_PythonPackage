@@ -8,15 +8,16 @@ From the repository root:
 uv run --locked python "VENUS Python Modules/Champions_FL/BeginNewExperiment/RegisterNewExperiment.py"
 ```
 
-This source-only program reuses the existing experiment form and defaults. It
-registers the experiment, parameters and Excel base layout in one transaction.
+This program runs from source (no executable yet) and reuses the existing
+experiment form and defaults. It registers the experiment, parameters and Excel
+base layout in one transaction.
 Selecting schedule `1` calls `dbo.ScheduleExperimentForImmediateExecution`, clearing
 the other experiments' scheduling flags. The database must already contain
 `dbo.ExperimentPlatePattern (ExperimentID, WellID, WellAssign)`.
 
 Plate registration happens during the first Champions iteration when its barcode
 is available. This program needs no barcodes and writes no task files. The existing
-`StartNewExperiment_1.py`, executable and VENUS method retain their current roles.
+`StartNewExperiment_1.py`, executable and VENUS method are unchanged.
 
 The opt-in database check uses Windows sign-in to `.\HAMILTON`, accepts only
 `EvoYeast_check`, creates a sample Excel layout and rolls back its records and
@@ -40,7 +41,7 @@ Remove-Item Env:HAMILTON_EXPERIMENT_ENTRY_SQL_TESTS
 
 ## 20260910
 
-- The eight Python files retain their workflow logic, argument parsing, GUI and
+- The nine Python files retain their workflow logic, argument parsing, GUI and
   entry points. They import reusable utilities from `hamilton_workflows` under `src`.
 - Shared logging, SQL connections/lookups, Gen5 parsing, fluorescence simulation,
   BCP imports, Excel assignments and task/sequence writers have been extracted.

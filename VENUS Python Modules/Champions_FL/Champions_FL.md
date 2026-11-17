@@ -1,5 +1,33 @@
 # Python Modules for Champions_FL Workflow.
 
+## Register an experiment before the first plate
+
+From the repository root:
+
+```powershell
+uv run --locked python "VENUS Python Modules/Champions_FL/BeginNewExperiment/RegisterNewExperiment.py"
+```
+
+This source-only program reuses the existing experiment form and defaults. It
+registers the experiment, parameters and Excel base layout in one transaction.
+Selecting schedule `1` calls `dbo.ScheduleExperimentForImmediateExecution`, clearing
+the other experiments' scheduling flags. The database must already contain
+`dbo.ExperimentPlatePattern (ExperimentID, WellID, WellAssign)`.
+
+Plate registration happens during the first Champions iteration when its barcode
+is available. This program needs no barcodes and writes no task files. The existing
+`StartNewExperiment_1.py`, executable and VENUS method retain their current roles.
+
+The opt-in database check uses Windows sign-in to `.\HAMILTON`, accepts only
+`EvoYeast_check`, creates a sample Excel layout and rolls back its records and
+scheduling changes. Run it separately from the offline suite:
+
+```powershell
+$env:HAMILTON_EXPERIMENT_ENTRY_SQL_TESTS = '1'
+uv run --locked python -m unittest discover -s tests -p test_experiment_entry_sql.py -v
+Remove-Item Env:HAMILTON_EXPERIMENT_ENTRY_SQL_TESTS
+```
+
 ## 20260915
 
 - Champions propagation selection, fluorescence calculations, deterministic well

@@ -6,6 +6,7 @@ import importlib.util
 from pathlib import Path
 import os
 import runpy
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -91,15 +92,16 @@ class ChampionsContracts(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return cursor, conn
 
-    def test_all_eight_scripts_own_their_entry_points_and_import_without_side_effects(self):
+    def test_all_scripts_own_their_entry_points_and_import_without_side_effects(self):
         paths = sorted((ROOT / 'VENUS Python Modules/Champions_FL').rglob('*.py'))
-        self.assertEqual(len(paths), 8)
+        self.assertEqual(len(paths), 9)
         with ExitStack() as stack:
             for target in ('pyodbc.connect', 'tkinter.Tk', 'subprocess.run', 'os.makedirs',
                            'pathlib.Path.mkdir', 'argparse.ArgumentParser.parse_args'):
                 stack.enter_context(patch(target, side_effect=AssertionError(f'Import side effect: {target}')))
             for path in paths:
-                namespace = runpy.run_path(str(path), run_name='import_test')
+                with patch.object(sys, 'path', [str(path.parent), *sys.path]):
+                    namespace = runpy.run_path(str(path), run_name='import_test')
                 self.assertTrue(callable(namespace['main']))
                 self.assertEqual(Path(namespace['main'].__code__.co_filename), path)
 
